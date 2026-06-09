@@ -1,0 +1,13 @@
+[package]
+name = "quadra"
+edition = "2024.beta"
+license = "Apache-2.0"
+
+[dependencies]
+
+[addresses]
+quadra = "0x0"
+
+[dev-dependencies]
+
+[dev-addresses]
