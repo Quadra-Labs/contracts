@@ -9,9 +9,12 @@
 /// 2. The user calls `pay_for_job` with those fields and locks `cost` $QUADRA in
 ///    a shared `Escrow`. The contract emits `JobPaid`, which the intake engine
 ///    watches for on-chain.
-/// 3. When the job is done, the intake engine (holder of `IntakeCap`) calls
+/// 3. When the job is delivered, the intake engine (holder of `IntakeCap`) calls
 ///    `release_payment`, paying the agent wallet the cost minus a percentage
 ///    platform fee (sent to the treasury).
+/// 4. If the agent never delivers, after a 30-minute wait the intake engine
+///    calls `refund_not_delivered`: the cost goes back to the user and the agent
+///    is scored 0 for the job (emitted for the data layer to record).
 ///
 /// The off-chain "agent signs a random key" handshake is verified by the intake
 /// engine off-chain; the on-chain release is purely capability-gated.
@@ -20,6 +23,7 @@ module quadra::intake;
 use std::string::String;
 use sui::balance::Balance;
 use sui::coin::{Self, Coin};
+use sui::clock::Clock;
 use sui::event;
 use quadra::quadra::QUADRA;
 use quadra::agent::{Self, AgentRegistry};
@@ -29,11 +33,19 @@ use quadra::job_access::{Self, JobAccessRegistry};
 const ENotRegistered: u64 = 0;
 /// Fee basis points must be <= 10000.
 const EBadFee: u64 = 1;
+/// Refund attempted before the non-delivery wait window elapsed.
+const ETooEarly: u64 = 2;
 
 /// Basis-points denominator (100% = 10000).
 const BPS_DENOM: u64 = 10000;
 
-/// Held by the intake engine. Its holder can release payments.
+/// A job may be refunded as non-delivered only after this wait (30 minutes).
+const REFUND_WAIT_MS: u64 = 30 * 60 * 1000;
+
+/// The score given to an agent for a job it never delivered.
+const NOT_DELIVERED_SCORE: u64 = 0;
+
+/// Held by the intake engine. Its holder can release or refund payments.
 public struct IntakeCap has key, store {
     id: UID,
 }
@@ -47,15 +59,17 @@ public struct IntakeConfig has key {
     treasury: address,
 }
 
-/// One escrowed user payment. This is what the contract stores after a user
-/// pays, matching the session object `{ session_id, job_id, agent_wallet, cost }`
-/// (`funds` holds `cost`).
+/// One escrowed user payment. The session form `{ session_id, job_id,
+/// agent_wallet, cost }` (`funds` holds `cost`), plus `user` and `paid_at_ms`
+/// so a non-delivered job can be refunded to the payer after the wait window.
 public struct Escrow has key {
     id: UID,
     session_id: String,
     job_id: String,
     agent_wallet: address,
     funds: Balance<QUADRA>,
+    user: address,
+    paid_at_ms: u64,
 }
 
 /// Emitted on `pay_for_job`; the intake engine watches for this.
@@ -65,6 +79,7 @@ public struct JobPaid has copy, drop {
     job_id: String,
     agent_wallet: address,
     cost: u64,
+    paid_at_ms: u64,
 }
 
 /// Emitted when a payment is released to an agent.
@@ -73,6 +88,17 @@ public struct PaymentReleased has copy, drop {
     agent_wallet: address,
     agent_amount: u64,
     fee: u64,
+}
+
+/// Emitted when a non-delivered job is refunded. The agent is scored 0; the data
+/// layer records that score and adds the job to the non-delivered list on Walrus.
+public struct JobNotDelivered has copy, drop {
+    escrow_id: ID,
+    job_id: String,
+    agent_wallet: address,
+    user: address,
+    refund_amount: u64,
+    agent_score: u64,
 }
 
 /// Mint the cap and share the config at publish. Default fee is 10%.
@@ -89,8 +115,7 @@ fun init(ctx: &mut TxContext) {
 /// target agent wallet is not registered (users cannot pay unregistered agents).
 ///
 /// Records `{ job_id -> (payer, agent_wallet) }` in the Seal access registry so
-/// only those two addresses can later decrypt the job result. The payer is the
-/// transaction sender — captured here because it is never stored on the escrow.
+/// only those two (and the scheduler) can later decrypt the job result.
 public fun pay_for_job(
     registry: &AgentRegistry,
     access_registry: &mut JobAccessRegistry,
@@ -98,6 +123,7 @@ public fun pay_for_job(
     job_id: String,
     agent_wallet: address,
     payment: Coin<QUADRA>,
+    clock: &Clock,
     ctx: &mut TxContext,
 ) {
     assert!(agent::is_registered(registry, agent_wallet), ENotRegistered);
@@ -108,6 +134,8 @@ public fun pay_for_job(
         job_id,
         agent_wallet,
         funds: payment.into_balance(),
+        user: ctx.sender(),
+        paid_at_ms: clock.timestamp_ms(),
     };
     event::emit(JobPaid {
         escrow_id: object::id(&escrow),
@@ -115,6 +143,7 @@ public fun pay_for_job(
         job_id: escrow.job_id,
         agent_wallet,
         cost: escrow.funds.value(),
+        paid_at_ms: escrow.paid_at_ms,
     });
     transfer::share_object(escrow);
 }
@@ -127,7 +156,7 @@ public fun release_payment(
     escrow: Escrow,
     ctx: &mut TxContext,
 ) {
-    let Escrow { id, session_id: _, job_id: _, agent_wallet, mut funds } = escrow;
+    let Escrow { id, session_id: _, job_id: _, agent_wallet, mut funds, user: _, paid_at_ms: _ } = escrow;
     let escrow_id = id.to_inner();
     let total = funds.value();
     let fee = (((total as u128) * (config.fee_bps as u128)) / (BPS_DENOM as u128)) as u64;
@@ -140,6 +169,31 @@ public fun release_payment(
     transfer::public_transfer(coin::from_balance(funds, ctx), agent_wallet);
 
     event::emit(PaymentReleased { escrow_id, agent_wallet, agent_amount, fee });
+    id.delete();
+}
+
+/// Refund a job the agent never delivered. Only callable after the 30-minute
+/// wait window; refunds the full cost to the user and scores the agent 0.
+/// Capability-gated: only the intake engine can call this.
+public fun refund_not_delivered(
+    _: &IntakeCap,
+    escrow: Escrow,
+    clock: &Clock,
+    ctx: &mut TxContext,
+) {
+    let Escrow { id, session_id: _, job_id, agent_wallet, funds, user, paid_at_ms } = escrow;
+    assert!(clock.timestamp_ms() >= paid_at_ms + REFUND_WAIT_MS, ETooEarly);
+    let escrow_id = id.to_inner();
+    let refund_amount = funds.value();
+    transfer::public_transfer(coin::from_balance(funds, ctx), user);
+    event::emit(JobNotDelivered {
+        escrow_id,
+        job_id,
+        agent_wallet,
+        user,
+        refund_amount,
+        agent_score: NOT_DELIVERED_SCORE,
+    });
     id.delete();
 }
 
@@ -157,6 +211,8 @@ public fun treasury(config: &IntakeConfig): address { config.treasury }
 public fun escrow_cost(escrow: &Escrow): u64 { escrow.funds.value() }
 
 public fun escrow_agent(escrow: &Escrow): address { escrow.agent_wallet }
+
+public fun escrow_paid_at_ms(escrow: &Escrow): u64 { escrow.paid_at_ms }
 
 #[test_only]
 public fun init_for_testing(ctx: &mut TxContext) {

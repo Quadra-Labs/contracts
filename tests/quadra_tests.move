@@ -81,8 +81,10 @@ fun test_intake_pay_and_release() {
     {
         let reg = sc.take_shared<AgentRegistry>();
         let mut access = sc.take_shared<JobAccessRegistry>();
+        let clk = clock::create_for_testing(sc.ctx());
         let pay = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
-        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, sc.ctx());
+        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, &clk, sc.ctx());
+        clk.destroy_for_testing();
         ts::return_shared(access);
         ts::return_shared(reg);
     };
@@ -109,6 +111,84 @@ fun test_intake_pay_and_release() {
 }
 
 #[test]
+fun test_refund_not_delivered() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    intake::init_for_testing(sc.ctx());
+    job_access::init_for_testing(sc.ctx());
+    register(&mut sc, AGENT);
+
+    // User pays 1000 at t = 0.
+    sc.next_tx(USER);
+    {
+        let reg = sc.take_shared<AgentRegistry>();
+        let mut access = sc.take_shared<JobAccessRegistry>();
+        let clk = clock::create_for_testing(sc.ctx());
+        let pay = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, &clk, sc.ctx());
+        clk.destroy_for_testing();
+        ts::return_shared(access);
+        ts::return_shared(reg);
+    };
+
+    // Intake engine refunds after the 30-minute wait (agent scored 0).
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<IntakeCap>();
+        let escrow = sc.take_shared<Escrow>();
+        let mut clk = clock::create_for_testing(sc.ctx());
+        clk.set_for_testing(30 * 60 * 1000);
+        intake::refund_not_delivered(&cap, escrow, &clk, sc.ctx());
+        clk.destroy_for_testing();
+        sc.return_to_sender(cap);
+    };
+
+    // User got the full 1000 back.
+    sc.next_tx(USER);
+    {
+        let back = sc.take_from_sender<Coin<QUADRA>>();
+        assert!(back.value() == 1000, 0);
+        back.burn_for_testing();
+    };
+    sc.end();
+}
+
+#[test]
+#[expected_failure(abort_code = intake::ETooEarly)]
+fun test_refund_too_early_fails() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    intake::init_for_testing(sc.ctx());
+    job_access::init_for_testing(sc.ctx());
+    register(&mut sc, AGENT);
+
+    sc.next_tx(USER);
+    {
+        let reg = sc.take_shared<AgentRegistry>();
+        let mut access = sc.take_shared<JobAccessRegistry>();
+        let clk = clock::create_for_testing(sc.ctx());
+        let pay = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, &clk, sc.ctx());
+        clk.destroy_for_testing();
+        ts::return_shared(access);
+        ts::return_shared(reg);
+    };
+
+    // Only 1 minute later -> too early, aborts.
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<IntakeCap>();
+        let escrow = sc.take_shared<Escrow>();
+        let mut clk = clock::create_for_testing(sc.ctx());
+        clk.set_for_testing(60 * 1000);
+        intake::refund_not_delivered(&cap, escrow, &clk, sc.ctx());
+        clk.destroy_for_testing();
+        sc.return_to_sender(cap);
+    };
+    sc.end();
+}
+
+#[test]
 #[expected_failure]
 fun test_pay_unregistered_fails() {
     let mut sc = ts::begin(ADMIN);
@@ -117,9 +197,11 @@ fun test_pay_unregistered_fails() {
     sc.next_tx(USER);
     let reg = sc.take_shared<AgentRegistry>();
     let mut access = sc.take_shared<JobAccessRegistry>();
+    let clk = clock::create_for_testing(sc.ctx());
     let pay = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
     // AGENT is not registered -> aborts.
-    intake::pay_for_job(&reg, &mut access, str(b"s"), str(b"j"), AGENT, pay, sc.ctx());
+    intake::pay_for_job(&reg, &mut access, str(b"s"), str(b"j"), AGENT, pay, &clk, sc.ctx());
+    clk.destroy_for_testing();
     ts::return_shared(access);
     ts::return_shared(reg);
     sc.end();
@@ -139,8 +221,10 @@ fun test_seal_access_user_and_agent() {
     {
         let reg = sc.take_shared<AgentRegistry>();
         let mut access = sc.take_shared<JobAccessRegistry>();
+        let clk = clock::create_for_testing(sc.ctx());
         let pay = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
-        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, sc.ctx());
+        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, &clk, sc.ctx());
+        clk.destroy_for_testing();
         ts::return_shared(access);
         ts::return_shared(reg);
     };
@@ -169,8 +253,10 @@ fun test_seal_access_third_party_denied() {
     {
         let reg = sc.take_shared<AgentRegistry>();
         let mut access = sc.take_shared<JobAccessRegistry>();
+        let clk = clock::create_for_testing(sc.ctx());
         let pay = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
-        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, sc.ctx());
+        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, &clk, sc.ctx());
+        clk.destroy_for_testing();
         ts::return_shared(access);
         ts::return_shared(reg);
     };
@@ -209,8 +295,10 @@ fun test_seal_access_scheduler() {
     {
         let reg = sc.take_shared<AgentRegistry>();
         let mut access = sc.take_shared<JobAccessRegistry>();
+        let clk = clock::create_for_testing(sc.ctx());
         let pay = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
-        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, sc.ctx());
+        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, &clk, sc.ctx());
+        clk.destroy_for_testing();
         ts::return_shared(access);
         ts::return_shared(reg);
     };
