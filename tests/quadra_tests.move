@@ -313,6 +313,46 @@ fun test_seal_access_scheduler() {
     sc.end();
 }
 
+/// A job's decryptors are bound once: reusing a job id (the ACL-hijack attempt)
+/// aborts, so an attacker can't re-record someone else's job to themselves.
+#[test]
+#[expected_failure(abort_code = job_access::EAlreadyBound)]
+fun test_record_rebind_fails() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    intake::init_for_testing(sc.ctx());
+    job_access::init_for_testing(sc.ctx());
+    register(&mut sc, AGENT);
+    register(&mut sc, AGENT2);
+
+    // First payment binds job-1 to (USER, AGENT).
+    sc.next_tx(USER);
+    {
+        let reg = sc.take_shared<AgentRegistry>();
+        let mut access = sc.take_shared<JobAccessRegistry>();
+        let clk = clock::create_for_testing(sc.ctx());
+        let pay = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        intake::pay_for_job(&reg, &mut access, str(b"sess-1"), str(b"job-1"), AGENT, pay, &clk, sc.ctx());
+        clk.destroy_for_testing();
+        ts::return_shared(access);
+        ts::return_shared(reg);
+    };
+
+    // A second payment reusing job-1 must abort (one-time binding).
+    sc.next_tx(AGENT2);
+    {
+        let reg = sc.take_shared<AgentRegistry>();
+        let mut access = sc.take_shared<JobAccessRegistry>();
+        let clk = clock::create_for_testing(sc.ctx());
+        let pay = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        intake::pay_for_job(&reg, &mut access, str(b"sess-2"), str(b"job-1"), AGENT2, pay, &clk, sc.ctx());
+        clk.destroy_for_testing();
+        ts::return_shared(access);
+        ts::return_shared(reg);
+    };
+    sc.end();
+}
+
 #[test]
 fun test_competition_split_and_threshold() {
     let mut sc = ts::begin(ADMIN);
@@ -392,18 +432,18 @@ fun test_staking_principal_plus_reward() {
     let mut sc = ts::begin(ADMIN);
     staking::init_for_testing(sc.ctx());
 
-    // Admin funds the reward reserve and sets 10% per epoch.
+    // Admin funds the reward reserve and emits 100 per epoch.
     sc.next_tx(ADMIN);
     {
         let cap = sc.take_from_sender<StakingAdminCap>();
         let mut pool = sc.take_shared<StakingPool>();
         staking::fund_rewards(&cap, &mut pool, coin::mint_for_testing<QUADRA>(1_000_000, sc.ctx()));
-        staking::set_reward_rate(&cap, &mut pool, 1000);
+        staking::set_emission(&cap, &mut pool, 100, sc.ctx());
         ts::return_shared(pool);
         sc.return_to_sender(cap);
     };
 
-    // User stakes 1000.
+    // User stakes 1000 (the only staker).
     sc.next_tx(USER);
     {
         let mut pool = sc.take_shared<StakingPool>();
@@ -411,7 +451,7 @@ fun test_staking_principal_plus_reward() {
         ts::return_shared(pool);
     };
 
-    // Advance one epoch, then unstake: reward = 1000 * 1000 * 1 / 10000 = 100.
+    // Advance one epoch, then unstake: sole staker takes the full 100 emission.
     sc.next_epoch(USER);
     sc.next_tx(USER);
     {
@@ -419,6 +459,60 @@ fun test_staking_principal_plus_reward() {
         let stake = sc.take_from_sender<Stake>();
         let out = staking::unstake(&mut pool, stake, sc.ctx());
         assert!(out.value() == 1100, 0);
+        out.burn_for_testing();
+        ts::return_shared(pool);
+    };
+    sc.end();
+}
+
+#[test]
+fun test_staking_pro_rata_split() {
+    let mut sc = ts::begin(ADMIN);
+    staking::init_for_testing(sc.ctx());
+
+    // Emit 300 per epoch.
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<StakingAdminCap>();
+        let mut pool = sc.take_shared<StakingPool>();
+        staking::fund_rewards(&cap, &mut pool, coin::mint_for_testing<QUADRA>(1_000_000, sc.ctx()));
+        staking::set_emission(&cap, &mut pool, 300, sc.ctx());
+        ts::return_shared(pool);
+        sc.return_to_sender(cap);
+    };
+
+    // AGENT stakes 1000, AGENT2 stakes 2000 (same epoch) -> shares 1/3 and 2/3.
+    sc.next_tx(AGENT);
+    {
+        let mut pool = sc.take_shared<StakingPool>();
+        staking::stake_and_keep(&mut pool, coin::mint_for_testing<QUADRA>(1000, sc.ctx()), sc.ctx());
+        ts::return_shared(pool);
+    };
+    sc.next_tx(AGENT2);
+    {
+        let mut pool = sc.take_shared<StakingPool>();
+        staking::stake_and_keep(&mut pool, coin::mint_for_testing<QUADRA>(2000, sc.ctx()), sc.ctx());
+        ts::return_shared(pool);
+    };
+
+    sc.next_epoch(ADMIN);
+
+    // AGENT gets 1/3 of 300 = 100; AGENT2 gets 2/3 = 200.
+    sc.next_tx(AGENT);
+    {
+        let mut pool = sc.take_shared<StakingPool>();
+        let stake = sc.take_from_sender<Stake>();
+        let out = staking::unstake(&mut pool, stake, sc.ctx());
+        assert!(out.value() == 1100, 0);
+        out.burn_for_testing();
+        ts::return_shared(pool);
+    };
+    sc.next_tx(AGENT2);
+    {
+        let mut pool = sc.take_shared<StakingPool>();
+        let stake = sc.take_from_sender<Stake>();
+        let out = staking::unstake(&mut pool, stake, sc.ctx());
+        assert!(out.value() == 2200, 1);
         out.burn_for_testing();
         ts::return_shared(pool);
     };

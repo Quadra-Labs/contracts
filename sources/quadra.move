@@ -4,9 +4,9 @@
 /// $QUADRA: the Quadra agent-network token.
 ///
 /// Fixed supply of 100,000,000,000 tokens at 6 decimals (= 1e17 base units,
-/// which fits in u64). The whole supply is minted to the deployer in `init`,
-/// and the `TreasuryCap` is handed to the deployer (who may later freeze it to
-/// make the supply immutable).
+/// which fits in u64). The whole supply is minted to the deployer in `init`, then
+/// the `TreasuryCap` is frozen — so the supply is hard-capped forever (no further
+/// mint or burn is ever possible).
 module quadra::quadra;
 
 use sui::coin;
@@ -17,7 +17,7 @@ const TOTAL_SUPPLY: u64 = 100_000_000_000_000_000;
 /// One-time witness for the currency.
 public struct QUADRA has drop {}
 
-/// Create the currency, mint the full supply to the deployer, keep the cap.
+/// Create the currency, mint the full supply to the deployer, then freeze the cap.
 #[allow(deprecated_usage)]
 fun init(witness: QUADRA, ctx: &mut TxContext) {
     let (mut treasury, metadata) = coin::create_currency(
@@ -34,9 +34,9 @@ fun init(witness: QUADRA, ctx: &mut TxContext) {
     let coins = treasury.mint(TOTAL_SUPPLY, ctx);
     transfer::public_transfer(coins, ctx.sender());
 
-    // Metadata is immutable; the deployer keeps the treasury cap.
+    // Freeze both metadata and the treasury cap: the supply is now immutable.
     transfer::public_freeze_object(metadata);
-    transfer::public_transfer(treasury, ctx.sender());
+    transfer::public_freeze_object(treasury);
 }
 
 /// The fixed total supply, in base units.

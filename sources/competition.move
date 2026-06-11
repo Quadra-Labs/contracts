@@ -20,6 +20,7 @@ use sui::balance::Balance;
 use sui::clock::Clock;
 use sui::coin::{Self, Coin};
 use sui::event;
+use sui::table::{Self, Table};
 use quadra::quadra::QUADRA;
 use quadra::agent::{Self, AgentRegistry};
 
@@ -49,7 +50,9 @@ public struct JobResult has store, copy, drop {
     score: u64,
 }
 
-/// A single competition with its prize pool and recorded results.
+/// A single competition with its prize pool and recorded results. `totals` and
+/// `participants` are maintained incrementally so payout never has to re-tally the
+/// (unbounded) `results` log.
 public struct Competition has key {
     id: UID,
     prize: Balance<QUADRA>,
@@ -57,6 +60,8 @@ public struct Competition has key {
     end_time_ms: u64,
     split_pct: vector<u64>,
     results: vector<JobResult>,
+    totals: Table<address, u64>,
+    participants: vector<address>,
     ended: bool,
 }
 
@@ -105,6 +110,8 @@ public fun create_competition(
         end_time_ms,
         split_pct,
         results: vector[],
+        totals: table::new(ctx),
+        participants: vector[],
         ended: false,
     };
     event::emit(CompetitionCreated {
@@ -131,6 +138,16 @@ public fun record_score(
     assert!(score <= MAX_SCORE, EBadScore);
     agent::assert_registered(registry, agent_id);
     competition.results.push_back(JobResult { agent_id, job_id, score });
+
+    // Maintain the running per-agent total (and the participant set) incrementally.
+    if (competition.totals.contains(agent_id)) {
+        let total = competition.totals.borrow_mut(agent_id);
+        *total = *total + score;
+    } else {
+        competition.totals.add(agent_id, score);
+        competition.participants.push_back(agent_id);
+    };
+
     event::emit(ScoreRecorded {
         competition_id: object::id(competition),
         agent_id,
@@ -147,9 +164,9 @@ public fun release_prizes(competition: &mut Competition, clock: &Clock, ctx: &mu
     assert!(clock.timestamp_ms() >= competition.end_time_ms, ENotEnded);
     competition.ended = true;
 
-    // Tally totals per agent, then drop everyone below the threshold.
-    let (agents, totals) = tally(&competition.results);
-    let (mut q_agents, mut q_totals) = filter_threshold(&agents, &totals, competition.threshold);
+    // Collect the qualifying agents (total >= threshold) from the maintained
+    // totals — no re-tally of the results log.
+    let (mut q_agents, mut q_totals) = qualifying(competition);
 
     let competition_id = object::id(competition);
     let prize_total = competition.prize.value();
@@ -194,57 +211,23 @@ fun valid_split(split_pct: &vector<u64>): bool {
     sum == PCT_DENOM
 }
 
-/// Build per-agent totals from the flat results list (dedup by address,
-/// preserving first-appearance order).
-fun tally(results: &vector<JobResult>): (vector<address>, vector<u64>) {
+/// Parallel (agents, totals) vectors for agents whose total is >= `threshold`,
+/// read straight from the maintained `totals`/`participants` (no results re-tally).
+fun qualifying(competition: &Competition): (vector<address>, vector<u64>) {
     let mut agents: vector<address> = vector[];
     let mut totals: vector<u64> = vector[];
-    let n = results.length();
+    let n = competition.participants.length();
     let mut i = 0;
     while (i < n) {
-        let r = &results[i];
-        let (found, idx) = index_of(&agents, r.agent_id);
-        if (found) {
-            let t = &mut totals[idx];
-            *t = *t + r.score;
-        } else {
-            agents.push_back(r.agent_id);
-            totals.push_back(r.score);
+        let agent = competition.participants[i];
+        let total = *competition.totals.borrow(agent);
+        if (total >= competition.threshold) {
+            agents.push_back(agent);
+            totals.push_back(total);
         };
         i = i + 1;
     };
     (agents, totals)
-}
-
-/// Keep only agents whose total is >= `threshold` (order preserved).
-fun filter_threshold(
-    agents: &vector<address>,
-    totals: &vector<u64>,
-    threshold: u64,
-): (vector<address>, vector<u64>) {
-    let mut out_a: vector<address> = vector[];
-    let mut out_t: vector<u64> = vector[];
-    let n = agents.length();
-    let mut i = 0;
-    while (i < n) {
-        if (totals[i] >= threshold) {
-            out_a.push_back(agents[i]);
-            out_t.push_back(totals[i]);
-        };
-        i = i + 1;
-    };
-    (out_a, out_t)
-}
-
-/// Linear search for `addr`; returns (found, index).
-fun index_of(agents: &vector<address>, addr: address): (bool, u64) {
-    let n = agents.length();
-    let mut i = 0;
-    while (i < n) {
-        if (agents[i] == addr) return (true, i);
-        i = i + 1;
-    };
-    (false, 0)
 }
 
 /// Index of the highest value (first one wins ties). Requires a non-empty input.

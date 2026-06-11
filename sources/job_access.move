@@ -23,6 +23,8 @@ use sui::table::{Self, Table};
 const ENoRecord: u64 = 0;
 /// The requester is neither the job's user nor its agent nor the scheduler.
 const ENoAccess: u64 = 1;
+/// A record already exists for this job id (bindings are one-time).
+const EAlreadyBound: u64 = 2;
 
 /// The two addresses allowed to read one job's result.
 public struct Parties has store, copy, drop {
@@ -57,28 +59,24 @@ public struct SchedulerSet has copy, drop {
     scheduler: address,
 }
 
-/// Mint the cap and share the registry once at publish. The scheduler defaults
-/// to the deployer; point it at the real scheduler wallet via `set_scheduler`.
+/// Mint the cap and share the registry once at publish. The scheduler is unset
+/// (`@0x0`) so no address has blanket decrypt authority until the admin points
+/// it at the real scheduler wallet via `set_scheduler`.
 fun init(ctx: &mut TxContext) {
     transfer::transfer(JobAccessCap { id: object::new(ctx) }, ctx.sender());
     transfer::share_object(JobAccessRegistry {
         id: object::new(ctx),
         access: table::new(ctx),
-        scheduler: ctx.sender(),
+        scheduler: @0x0,
     });
 }
 
-/// Record who may read a job's result. Called by `intake::pay_for_job`.
-/// `String` is copyable, so the caller keeps ownership of `job_id`. Overwrites
-/// any existing record for the same job id.
-public fun record(reg: &mut JobAccessRegistry, job_id: String, user: address, agent: address) {
-    if (reg.access.contains(job_id)) {
-        let parties = reg.access.borrow_mut(job_id);
-        parties.user = user;
-        parties.agent = agent;
-    } else {
-        reg.access.add(job_id, Parties { user, agent });
-    };
+/// Record who may read a job's result. Only callable inside the package (by
+/// `intake::pay_for_job`), and only once per job id — a job's decryptors cannot
+/// be rebound, so the ACL can't be hijacked by re-recording an existing job id.
+public(package) fun record(reg: &mut JobAccessRegistry, job_id: String, user: address, agent: address) {
+    assert!(!reg.access.contains(job_id), EAlreadyBound);
+    reg.access.add(job_id, Parties { user, agent });
     event::emit(AccessRecorded { job_id, user, agent });
 }
 
