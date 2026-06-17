@@ -38,13 +38,18 @@ public struct JobAccessCap has key, store {
 }
 
 /// Shared registry of `{ job_id -> Parties }`, written at payment time, plus the
-/// scheduler engine that may read any result.
+/// scheduler and competition engines that may read any result.
 public struct JobAccessRegistry has key {
     id: UID,
     access: Table<String, Parties>,
     /// The scheduler engine wallet; allowed to decrypt every job result so the
     /// evaluation engines can score it.
     scheduler: address,
+    /// The competition engine wallet; allowed to decrypt every competition job
+    /// result. Competition jobs are free, so they never go through
+    /// `intake::pay_for_job` and have no `(user, agent)` record here — only this
+    /// blanket reader can decrypt them for scoring.
+    competition: address,
 }
 
 /// Emitted when access is recorded for a job.
@@ -59,15 +64,22 @@ public struct SchedulerSet has copy, drop {
     scheduler: address,
 }
 
-/// Mint the cap and share the registry once at publish. The scheduler is unset
-/// (`@0x0`) so no address has blanket decrypt authority until the admin points
-/// it at the real scheduler wallet via `set_scheduler`.
+/// Emitted when the competition engine address is set.
+public struct CompetitionEngineSet has copy, drop {
+    competition: address,
+}
+
+/// Mint the cap and share the registry once at publish. The scheduler and
+/// competition engines are unset (`@0x0`) so no address has blanket decrypt
+/// authority until the admin points them at the real engine wallets via
+/// `set_scheduler` / `set_competition`.
 fun init(ctx: &mut TxContext) {
     transfer::transfer(JobAccessCap { id: object::new(ctx) }, ctx.sender());
     transfer::share_object(JobAccessRegistry {
         id: object::new(ctx),
         access: table::new(ctx),
         scheduler: @0x0,
+        competition: @0x0,
     });
 }
 
@@ -86,11 +98,20 @@ public fun set_scheduler(_: &JobAccessCap, reg: &mut JobAccessRegistry, schedule
     event::emit(SchedulerSet { scheduler });
 }
 
-/// Core policy check, shared by `seal_approve` and tests. The scheduler may read
-/// any result; otherwise the requester must be the job's recorded user or agent.
+/// Point the policy at the competition engine wallet. Capability-gated.
+public fun set_competition(_: &JobAccessCap, reg: &mut JobAccessRegistry, competition: address) {
+    reg.competition = competition;
+    event::emit(CompetitionEngineSet { competition });
+}
+
+/// Core policy check, shared by `seal_approve` and tests. The scheduler and the
+/// competition engine may read any result; otherwise the requester must be the
+/// job's recorded user or agent.
 public fun assert_can_read(reg: &JobAccessRegistry, id: vector<u8>, requester: address) {
-    // The scheduler engine decrypts every result to feed the evaluation engines.
+    // The scheduler and competition engines decrypt every result to feed the
+    // evaluation engines.
     if (requester == reg.scheduler) return;
+    if (requester == reg.competition) return;
     let job_id = string::utf8(id);
     assert!(reg.access.contains(job_id), ENoRecord);
     let parties = reg.access.borrow(job_id);
@@ -105,6 +126,8 @@ entry fun seal_approve(id: vector<u8>, reg: &JobAccessRegistry, ctx: &TxContext)
 }
 
 public fun scheduler(reg: &JobAccessRegistry): address { reg.scheduler }
+
+public fun competition(reg: &JobAccessRegistry): address { reg.competition }
 
 #[test_only]
 public fun init_for_testing(ctx: &mut TxContext) {

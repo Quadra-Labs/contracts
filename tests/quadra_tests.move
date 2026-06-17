@@ -24,6 +24,7 @@ const AGENT: address = @0xA1;
 const AGENT2: address = @0xA2;
 const USER: address = @0xC1;
 const SCHEDULER: address = @0x5C;
+const COMPETITION: address = @0xC0;
 
 fun str(bytes: vector<u8>): String { string::utf8(bytes) }
 
@@ -366,7 +367,8 @@ fun test_competition_split_and_threshold() {
     {
         let cap = sc.take_from_sender<CompetitionCap>();
         let prize = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
-        competition::create_competition(&cap, prize, 50, 100, vector[60, 40], sc.ctx());
+        // kind 0 = KIND_SCORING.
+        competition::create_competition(&cap, 0, prize, 50, 100, vector[60, 40], sc.ctx());
         sc.return_to_sender(cap);
     };
 
@@ -413,7 +415,8 @@ fun test_release_before_end_fails() {
     {
         let cap = sc.take_from_sender<CompetitionCap>();
         let prize = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
-        competition::create_competition(&cap, prize, 50, 1_000_000, vector[100], sc.ctx());
+        // kind 0 = KIND_SCORING.
+        competition::create_competition(&cap, 0, prize, 50, 1_000_000, vector[100], sc.ctx());
         sc.return_to_sender(cap);
     };
     sc.next_tx(ADMIN);
@@ -423,6 +426,247 @@ fun test_release_before_end_fails() {
         competition::release_prizes(&mut comp, &clk, sc.ctx()); // aborts: not ended
         clk.destroy_for_testing();
         ts::return_shared(comp);
+    };
+    sc.end();
+}
+
+/// Joining pre-seeds the agent at 0 and adds it to the participant set; an enrolled
+/// but idle agent stays below a positive threshold and wins nothing, while a scored
+/// joiner is paid. Proves `join_competition` doesn't corrupt the payout.
+#[test]
+fun test_join_pre_seeds_and_idle_eliminated() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    competition::init_for_testing(sc.ctx());
+    register(&mut sc, AGENT);
+    register(&mut sc, AGENT2);
+
+    // Scoring comp, threshold 1 (so a 0 total is eliminated), winner takes 100%.
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let prize = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        competition::create_competition(&cap, 0, prize, 1, 100, vector[100], sc.ctx());
+        sc.return_to_sender(cap);
+    };
+
+    // Both agents enrol themselves on-chain.
+    sc.next_tx(AGENT);
+    {
+        let mut comp = sc.take_shared<Competition>();
+        let reg = sc.take_shared<AgentRegistry>();
+        competition::join_competition(&mut comp, &reg, sc.ctx());
+        ts::return_shared(reg);
+        ts::return_shared(comp);
+    };
+    sc.next_tx(AGENT2);
+    {
+        let mut comp = sc.take_shared<Competition>();
+        let reg = sc.take_shared<AgentRegistry>();
+        competition::join_competition(&mut comp, &reg, sc.ctx());
+        ts::return_shared(reg);
+        ts::return_shared(comp);
+    };
+
+    // Only AGENT2 gets a score; AGENT stays idle at its pre-seeded 0.
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let mut comp = sc.take_shared<Competition>();
+        let reg = sc.take_shared<AgentRegistry>();
+        competition::record_score(&cap, &mut comp, &reg, AGENT2, str(b"j1"), 50);
+        ts::return_shared(reg);
+        ts::return_shared(comp);
+        sc.return_to_sender(cap);
+    };
+
+    sc.next_tx(ADMIN);
+    {
+        let mut comp = sc.take_shared<Competition>();
+        let mut clk = clock::create_for_testing(sc.ctx());
+        clk.set_for_testing(200);
+        competition::release_prizes(&mut comp, &clk, sc.ctx());
+        clk.destroy_for_testing();
+        ts::return_shared(comp);
+    };
+
+    // AGENT2 (50 >= 1) takes the whole 1000; AGENT (0 < 1) is eliminated.
+    sc.next_tx(AGENT2);
+    {
+        let won = sc.take_from_sender<Coin<QUADRA>>();
+        assert!(won.value() == 1000, 0);
+        won.burn_for_testing();
+    };
+    sc.end();
+}
+
+/// Enrolment is one-time per agent.
+#[test]
+#[expected_failure(abort_code = competition::EAlreadyJoined)]
+fun test_double_join_fails() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    competition::init_for_testing(sc.ctx());
+    register(&mut sc, AGENT);
+
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let prize = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        competition::create_competition(&cap, 0, prize, 1, 100, vector[100], sc.ctx());
+        sc.return_to_sender(cap);
+    };
+
+    sc.next_tx(AGENT);
+    {
+        let mut comp = sc.take_shared<Competition>();
+        let reg = sc.take_shared<AgentRegistry>();
+        competition::join_competition(&mut comp, &reg, sc.ctx());
+        competition::join_competition(&mut comp, &reg, sc.ctx()); // aborts: already joined
+        ts::return_shared(reg);
+        ts::return_shared(comp);
+    };
+    sc.end();
+}
+
+/// `record_score` is rejected on a PERFORMANCE competition.
+#[test]
+#[expected_failure(abort_code = competition::EWrongKind)]
+fun test_record_score_wrong_kind_fails() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    competition::init_for_testing(sc.ctx());
+    register(&mut sc, AGENT);
+
+    // kind 1 = KIND_PERFORMANCE.
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let prize = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        competition::create_competition(&cap, 1, prize, 1, 100, vector[100], sc.ctx());
+        sc.return_to_sender(cap);
+    };
+
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let mut comp = sc.take_shared<Competition>();
+        let reg = sc.take_shared<AgentRegistry>();
+        competition::record_score(&cap, &mut comp, &reg, AGENT, str(b"j1"), 50); // aborts: wrong kind
+        ts::return_shared(reg);
+        ts::return_shared(comp);
+        sc.return_to_sender(cap);
+    };
+    sc.end();
+}
+
+/// `record_performance` is rejected on a SCORING competition.
+#[test]
+#[expected_failure(abort_code = competition::EWrongKind)]
+fun test_record_performance_wrong_kind_fails() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    competition::init_for_testing(sc.ctx());
+    register(&mut sc, AGENT);
+
+    // kind 0 = KIND_SCORING.
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let prize = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        competition::create_competition(&cap, 0, prize, 1, 100, vector[100], sc.ctx());
+        sc.return_to_sender(cap);
+    };
+
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let mut comp = sc.take_shared<Competition>();
+        let reg = sc.take_shared<AgentRegistry>();
+        competition::record_performance(&cap, &mut comp, &reg, AGENT, 1_005_000); // aborts: wrong kind
+        ts::return_shared(reg);
+        ts::return_shared(comp);
+        sc.return_to_sender(cap);
+    };
+    sc.end();
+}
+
+/// PERFORMANCE mode: `record_performance` OVERWRITES (does not accumulate). AGENT is
+/// recorded high then overwritten low, so AGENT2 (recorded once, higher final metric)
+/// wins. If the metric had accumulated, AGENT would wrongly win.
+#[test]
+fun test_performance_overwrite_and_pays() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    competition::init_for_testing(sc.ctx());
+    register(&mut sc, AGENT);
+    register(&mut sc, AGENT2);
+
+    // kind 1 = KIND_PERFORMANCE; threshold = PERF_BASE (1_000_000) = require >= 0% ROI.
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let prize = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        competition::create_competition(&cap, 1, prize, 1_000_000, 100, vector[100], sc.ctx());
+        sc.return_to_sender(cap);
+    };
+
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let mut comp = sc.take_shared<Competition>();
+        let reg = sc.take_shared<AgentRegistry>();
+        competition::record_performance(&cap, &mut comp, &reg, AGENT, 1_009_000);  // +9% (first)
+        competition::record_performance(&cap, &mut comp, &reg, AGENT2, 1_005_000); // +5%
+        competition::record_performance(&cap, &mut comp, &reg, AGENT, 1_001_000);  // overwrite -> +0.1%
+        ts::return_shared(reg);
+        ts::return_shared(comp);
+        sc.return_to_sender(cap);
+    };
+
+    sc.next_tx(ADMIN);
+    {
+        let mut comp = sc.take_shared<Competition>();
+        let mut clk = clock::create_for_testing(sc.ctx());
+        clk.set_for_testing(200);
+        competition::release_prizes(&mut comp, &clk, sc.ctx());
+        clk.destroy_for_testing();
+        ts::return_shared(comp);
+    };
+
+    // AGENT2 (1_005_000) now outranks AGENT (overwritten to 1_001_000) and takes 1000.
+    sc.next_tx(AGENT2);
+    {
+        let won = sc.take_from_sender<Coin<QUADRA>>();
+        assert!(won.value() == 1000, 0);
+        won.burn_for_testing();
+    };
+    sc.end();
+}
+
+/// The competition engine wallet may decrypt any competition result (which is never
+/// recorded in `access`, since competition jobs are free), just like the scheduler.
+#[test]
+fun test_seal_access_competition_engine() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    job_access::init_for_testing(sc.ctx());
+
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<JobAccessCap>();
+        let mut access = sc.take_shared<JobAccessRegistry>();
+        job_access::set_competition(&cap, &mut access, COMPETITION);
+        ts::return_shared(access);
+        sc.return_to_sender(cap);
+    };
+
+    sc.next_tx(COMPETITION);
+    {
+        let access = sc.take_shared<JobAccessRegistry>();
+        // No access record exists for this id, but the competition engine reads any result.
+        job_access::assert_can_read(&access, b"comp-job-1", COMPETITION);
+        ts::return_shared(access);
     };
     sc.end();
 }

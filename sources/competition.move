@@ -3,15 +3,22 @@
 
 /// Competition engine.
 ///
-/// Agents run a fixed set of predefined jobs; the evaluation engine scores each
-/// in [0, 100]; the competition engine (holder of `CompetitionCap`) records
-/// those scores on-chain with `record_score`. Each agent accumulates a total
-/// score across the jobs.
+/// Agents enrol with `join_competition`, then receive free jobs from the
+/// competition engine. A competition resolves in one of two modes (`kind`):
 ///
-/// When the competition reaches its end time, anyone can call `release_prizes`
-/// (public + time-gated). Agents whose total score is below `threshold` are
-/// eliminated; the remaining top agents split the prize pool according to
-/// `split_pct` (e.g. [50, 30, 20] => top 3 take 50% / 30% / 20%).
+/// - SCORING (`KIND_SCORING`): the evaluation engine scores each job in [0, 100]
+///   and the competition engine (holder of `CompetitionCap`) records them with
+///   `record_score`. Each agent ACCUMULATES a total score across its jobs.
+/// - PERFORMANCE (`KIND_PERFORMANCE`): a single performance metric per agent
+///   (e.g. trading ROI) is recorded with `record_performance`, which OVERWRITES
+///   the agent's ranking value. ROI is encoded as `metric = PERF_BASE + roi_bps`
+///   (floored at 0), so a larger metric is a better result.
+///
+/// Either way the per-agent ranking value lives in `totals`. When the competition
+/// reaches its end time, anyone can call `release_prizes` (public + time-gated).
+/// Agents whose ranking value is below `threshold` are eliminated; the remaining
+/// top agents split the prize pool according to `split_pct` (e.g. [50, 30, 20] =>
+/// top 3 take 50% / 30% / 20%).
 #[allow(lint(self_transfer))]
 module quadra::competition;
 
@@ -32,11 +39,25 @@ const EBadScore: u64 = 1;
 const ENotEnded: u64 = 3;
 /// Competition already paid out.
 const EAlreadyEnded: u64 = 4;
+/// Wrong recorder for the competition kind (score on a performance comp, or
+/// performance on a scoring comp), or an unknown `kind` at creation.
+const EWrongKind: u64 = 5;
+/// The agent has already joined this competition.
+const EAlreadyJoined: u64 = 6;
 
 /// Max valid job score.
 const MAX_SCORE: u64 = 100;
 /// Percentage denominator.
 const PCT_DENOM: u64 = 100;
+
+/// Resolution by accumulated job scores (`record_score`).
+const KIND_SCORING: u8 = 0;
+/// Resolution by a single overwriteable performance metric (`record_performance`).
+const KIND_PERFORMANCE: u8 = 1;
+/// Zero-ROI baseline for the performance metric: `metric = PERF_BASE + roi_bps`
+/// (floored at 0). 1_000_000 leaves head-room for the full [-10000, +inf] bps
+/// range without underflow at -100% ROI.
+const PERF_BASE: u64 = 1_000_000;
 
 /// Held by the competition engine; gates creating competitions and recording.
 public struct CompetitionCap has key, store {
@@ -55,6 +76,8 @@ public struct JobResult has store, copy, drop {
 /// (unbounded) `results` log.
 public struct Competition has key {
     id: UID,
+    /// Resolution mode: `KIND_SCORING` or `KIND_PERFORMANCE`.
+    kind: u8,
     prize: Balance<QUADRA>,
     threshold: u64,
     end_time_ms: u64,
@@ -67,10 +90,16 @@ public struct Competition has key {
 
 public struct CompetitionCreated has copy, drop {
     competition_id: ID,
+    kind: u8,
     prize: u64,
     threshold: u64,
     end_time_ms: u64,
     winners: u64,
+}
+
+public struct AgentJoined has copy, drop {
+    competition_id: ID,
+    agent_id: address,
 }
 
 public struct ScoreRecorded has copy, drop {
@@ -78,6 +107,12 @@ public struct ScoreRecorded has copy, drop {
     agent_id: address,
     job_id: String,
     score: u64,
+}
+
+public struct PerformanceRecorded has copy, drop {
+    competition_id: ID,
+    agent_id: address,
+    metric: u64,
 }
 
 public struct PrizeAwarded has copy, drop {
@@ -92,19 +127,23 @@ fun init(ctx: &mut TxContext) {
     transfer::transfer(CompetitionCap { id: object::new(ctx) }, ctx.sender());
 }
 
-/// Create a competition funded with `prize`. `split_pct` must sum to 100; its
-/// length is the number of winners. Capability-gated.
+/// Create a competition of `kind` (`KIND_SCORING` or `KIND_PERFORMANCE`) funded
+/// with `prize`. `split_pct` must sum to 100; its length is the number of
+/// winners. Capability-gated.
 public fun create_competition(
     _: &CompetitionCap,
+    kind: u8,
     prize: Coin<QUADRA>,
     threshold: u64,
     end_time_ms: u64,
     split_pct: vector<u64>,
     ctx: &mut TxContext,
 ) {
+    assert!(kind == KIND_SCORING || kind == KIND_PERFORMANCE, EWrongKind);
     assert!(valid_split(&split_pct), EBadSplit);
     let competition = Competition {
         id: object::new(ctx),
+        kind,
         prize: prize.into_balance(),
         threshold,
         end_time_ms,
@@ -116,6 +155,7 @@ public fun create_competition(
     };
     event::emit(CompetitionCreated {
         competition_id: object::id(&competition),
+        kind,
         prize: competition.prize.value(),
         threshold,
         end_time_ms,
@@ -124,8 +164,28 @@ public fun create_competition(
     transfer::share_object(competition);
 }
 
-/// Record one job score for an agent. Capability-gated. Aborts if the agent is
-/// not registered, the score is out of range, or the competition already ended.
+/// Enrol the calling agent in a competition. Public: any registered agent joins
+/// itself. Pre-seeds the agent's ranking value at 0 and adds it to the
+/// participant set (so the engine sees a verifiable `AgentJoined` and can
+/// dispatch free jobs). Aborts if the competition has ended or the agent already
+/// joined.
+public fun join_competition(
+    competition: &mut Competition,
+    registry: &AgentRegistry,
+    ctx: &mut TxContext,
+) {
+    assert!(!competition.ended, EAlreadyEnded);
+    let agent_id = ctx.sender();
+    agent::assert_registered(registry, agent_id);
+    assert!(!competition.totals.contains(agent_id), EAlreadyJoined);
+    competition.totals.add(agent_id, 0);
+    competition.participants.push_back(agent_id);
+    event::emit(AgentJoined { competition_id: object::id(competition), agent_id });
+}
+
+/// Record one job score for an agent (SCORING mode only). Capability-gated.
+/// Aborts if the agent is not registered, the score is out of range, the
+/// competition is not a scoring competition, or it already ended.
 public fun record_score(
     _: &CompetitionCap,
     competition: &mut Competition,
@@ -135,6 +195,7 @@ public fun record_score(
     score: u64,
 ) {
     assert!(!competition.ended, EAlreadyEnded);
+    assert!(competition.kind == KIND_SCORING, EWrongKind);
     assert!(score <= MAX_SCORE, EBadScore);
     agent::assert_registered(registry, agent_id);
     competition.results.push_back(JobResult { agent_id, job_id, score });
@@ -153,6 +214,39 @@ public fun record_score(
         agent_id,
         job_id,
         score,
+    });
+}
+
+/// Record an agent's performance metric (PERFORMANCE mode only). Capability-gated.
+/// Unlike `record_score` this OVERWRITES the agent's ranking value, so the engine
+/// can re-record idempotently from the signed end-of-window ROI. `metric` is the
+/// `PERF_BASE + roi_bps` encoding (see module doc); a larger metric ranks higher.
+/// Aborts if the agent is not registered, the competition is not a performance
+/// competition, or it already ended.
+public fun record_performance(
+    _: &CompetitionCap,
+    competition: &mut Competition,
+    registry: &AgentRegistry,
+    agent_id: address,
+    metric: u64,
+) {
+    assert!(!competition.ended, EAlreadyEnded);
+    assert!(competition.kind == KIND_PERFORMANCE, EWrongKind);
+    agent::assert_registered(registry, agent_id);
+
+    // Overwrite (not accumulate); add to the participant set on first sight.
+    if (competition.totals.contains(agent_id)) {
+        let total = competition.totals.borrow_mut(agent_id);
+        *total = metric;
+    } else {
+        competition.totals.add(agent_id, metric);
+        competition.participants.push_back(agent_id);
+    };
+
+    event::emit(PerformanceRecorded {
+        competition_id: object::id(competition),
+        agent_id,
+        metric,
     });
 }
 
@@ -247,6 +341,13 @@ fun best_index(totals: &vector<u64>): u64 {
 }
 
 public fun prize_balance(competition: &Competition): u64 { competition.prize.value() }
+
+public fun kind(competition: &Competition): u8 { competition.kind }
+
+/// The zero-ROI baseline for the performance metric encoding (`metric =
+/// PERF_BASE + roi_bps`). The off-chain ROI evaluator and engine must use this
+/// exact base; exposed so they can read it on-chain instead of re-hardcoding.
+public fun perf_base(): u64 { PERF_BASE }
 
 public fun threshold(competition: &Competition): u64 { competition.threshold }
 
