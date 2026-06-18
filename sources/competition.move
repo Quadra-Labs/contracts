@@ -44,6 +44,8 @@ const EAlreadyEnded: u64 = 4;
 const EWrongKind: u64 = 5;
 /// The agent has already joined this competition.
 const EAlreadyJoined: u64 = 6;
+/// Scoreless agents are never evaluated, so they may not join or be recorded.
+const EScorelessAgent: u64 = 7;
 
 /// Max valid job score.
 const MAX_SCORE: u64 = 100;
@@ -177,6 +179,7 @@ public fun join_competition(
     assert!(!competition.ended, EAlreadyEnded);
     let agent_id = ctx.sender();
     agent::assert_registered(registry, agent_id);
+    assert!(!agent::is_scoreless(registry, agent_id), EScorelessAgent);
     assert!(!competition.totals.contains(agent_id), EAlreadyJoined);
     competition.totals.add(agent_id, 0);
     competition.participants.push_back(agent_id);
@@ -198,6 +201,7 @@ public fun record_score(
     assert!(competition.kind == KIND_SCORING, EWrongKind);
     assert!(score <= MAX_SCORE, EBadScore);
     agent::assert_registered(registry, agent_id);
+    assert!(!agent::is_scoreless(registry, agent_id), EScorelessAgent);
     competition.results.push_back(JobResult { agent_id, job_id, score });
 
     // Maintain the running per-agent total (and the participant set) incrementally.
@@ -233,6 +237,7 @@ public fun record_performance(
     assert!(!competition.ended, EAlreadyEnded);
     assert!(competition.kind == KIND_PERFORMANCE, EWrongKind);
     agent::assert_registered(registry, agent_id);
+    assert!(!agent::is_scoreless(registry, agent_id), EScorelessAgent);
 
     // Overwrite (not accumulate); add to the participant set on first sight.
     if (competition.totals.contains(agent_id)) {

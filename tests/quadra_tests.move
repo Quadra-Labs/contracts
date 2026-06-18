@@ -29,9 +29,13 @@ const COMPETITION: address = @0xC0;
 fun str(bytes: vector<u8>): String { string::utf8(bytes) }
 
 fun register(scenario: &mut ts::Scenario, who: address) {
+    register_kind(scenario, who, false);
+}
+
+fun register_kind(scenario: &mut ts::Scenario, who: address, scoreless: bool) {
     scenario.next_tx(who);
     let mut reg = scenario.take_shared<AgentRegistry>();
-    agent::register_agent(&mut reg, who, str(b"name"), str(b"desc"), str(b"finance"), scenario.ctx());
+    agent::register_agent(&mut reg, who, str(b"name"), str(b"desc"), str(b"finance"), scoreless, scenario.ctx());
     ts::return_shared(reg);
 }
 
@@ -523,6 +527,34 @@ fun test_double_join_fails() {
         let reg = sc.take_shared<AgentRegistry>();
         competition::join_competition(&mut comp, &reg, sc.ctx());
         competition::join_competition(&mut comp, &reg, sc.ctx()); // aborts: already joined
+        ts::return_shared(reg);
+        ts::return_shared(comp);
+    };
+    sc.end();
+}
+
+/// A scoreless agent cannot join a competition.
+#[test]
+#[expected_failure(abort_code = competition::EScorelessAgent)]
+fun test_scoreless_cannot_join() {
+    let mut sc = ts::begin(ADMIN);
+    agent::init_for_testing(sc.ctx());
+    competition::init_for_testing(sc.ctx());
+    register_kind(&mut sc, AGENT, true); // scoreless
+
+    sc.next_tx(ADMIN);
+    {
+        let cap = sc.take_from_sender<CompetitionCap>();
+        let prize = coin::mint_for_testing<QUADRA>(1000, sc.ctx());
+        competition::create_competition(&cap, 0, prize, 1, 100, vector[100], sc.ctx());
+        sc.return_to_sender(cap);
+    };
+
+    sc.next_tx(AGENT);
+    {
+        let mut comp = sc.take_shared<Competition>();
+        let reg = sc.take_shared<AgentRegistry>();
+        competition::join_competition(&mut comp, &reg, sc.ctx()); // aborts: scoreless
         ts::return_shared(reg);
         ts::return_shared(comp);
     };

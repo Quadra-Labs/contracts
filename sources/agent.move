@@ -24,6 +24,9 @@ public struct AgentInfo has store {
     name: String,
     description: String,
     category: String,
+    /// Scoreless agents are paid on delivery but never evaluated/scored and may
+    /// not join competitions. Set once at registration; not changeable.
+    scoreless: bool,
 }
 
 /// Shared registry of all agents.
@@ -38,6 +41,7 @@ public struct AgentRegistered has copy, drop {
     owner: address,
     name: String,
     category: String,
+    scoreless: bool,
 }
 
 /// Create and share the registry once at publish.
@@ -51,18 +55,21 @@ fun init(ctx: &mut TxContext) {
 
 /// Register the caller as an agent. The caller's address is the agent id and
 /// the payee for jobs and prizes; `owner` is stored as metadata only.
+/// `scoreless` agents are paid on delivery but never scored and may not compete;
+/// it is fixed here and cannot be changed later.
 public fun register_agent(
     registry: &mut AgentRegistry,
     owner: address,
     name: String,
     description: String,
     category: String,
+    scoreless: bool,
     ctx: &mut TxContext,
 ) {
     let agent_id = ctx.sender();
     assert!(!registry.agents.contains(agent_id), EAlreadyRegistered);
-    registry.agents.add(agent_id, AgentInfo { owner, name, description, category });
-    event::emit(AgentRegistered { agent_id, owner, name, category });
+    registry.agents.add(agent_id, AgentInfo { owner, name, description, category, scoreless });
+    event::emit(AgentRegistered { agent_id, owner, name, category, scoreless });
 }
 
 /// Update the caller's own agent metadata.
@@ -89,6 +96,12 @@ public fun is_registered(registry: &AgentRegistry, agent_id: address): bool {
 /// Abort unless `agent_id` is registered (shared helper for other modules).
 public fun assert_registered(registry: &AgentRegistry, agent_id: address) {
     assert!(registry.agents.contains(agent_id), ENotRegistered);
+}
+
+/// True if `agent_id` is a registered scoreless agent. Used by competition to
+/// bar scoreless agents from joining or being recorded.
+public fun is_scoreless(registry: &AgentRegistry, agent_id: address): bool {
+    registry.agents.contains(agent_id) && registry.agents.borrow(agent_id).scoreless
 }
 
 public fun owner(registry: &AgentRegistry, agent_id: address): address {
