@@ -1,2 +1,12 @@
-# Sui Move build output. Move.toml and Move.lock are committed.
-build
+# Foundry build output
+out/
+cache/
+broadcast/
+
+# Tests are written, run green, and not committed - this repo carries source only.
+# They live outside the working tree between runs; see the migration notes.
+test/
+
+# Local Anvil deployments. Real networks (e.g. 114.json) ARE committed, because every other
+# repo reads its contract addresses from that file.
+deployments/31337.json

@@ -1,0 +1,18 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+solc = "0.8.25"
+optimizer = true
+optimizer_runs = 200
+# JobEscrow's JobPaid event carries nine fields (both deadlines, the user's ECIES pubkey and the job
+# params), which exceeds what the legacy codegen can keep on the stack. viaIR is the supported fix.
+via_ir = true
+evm_version = "paris"
+# Deploy.s.sol writes the deployed addresses here so off-chain processes read one file.
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
+
+# Coston2 testnet for scripts/verification
+[rpc_endpoints]
+coston2 = "https://coston2-api.flare.network/ext/C/rpc"
