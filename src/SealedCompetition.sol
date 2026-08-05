@@ -2,6 +2,7 @@
 pragma solidity 0.8.25;
 
 import {IFtsoFeedVerifier} from "./interfaces/IFtsoFeedVerifier.sol";
+import {FtsoLib} from "./FtsoLib.sol";
 
 interface ITeeRegistry {
     function activeTeeWallet() external view returns (address);
@@ -91,6 +92,26 @@ contract SealedCompetition {
     /// Each agent's own stake, so a cancelled competition can return exactly what each one posted.
     mapping(bytes32 => mapping(address => uint256)) public staked;
     mapping(bytes32 => bytes32) public settledReceiptHash;
+    /// Agents already folded into this competition's settlement. Set as each entry is processed, so
+    /// a repeated agent in `entries[]` cannot take two winner slots or two Passport records.
+    mapping(bytes32 => mapping(address => bool)) public recorded;
+    /// Prizes credited but not yet withdrawn. Settlement never pushes value to a winner; it credits
+    /// here and the winner pulls. One winner whose `receive()` reverts would otherwise revert the
+    /// whole settlement transaction, permanently freezing a funded competition.
+    mapping(address => uint256) public owed;
+
+    // --- EIP-712 ---------------------------------------------------------------------------------
+    // These three strings are the ABI of trust. The TEE signer, this contract and the verify tool
+    // must agree on them byte for byte, so they are frozen here and changed only as a coordinated
+    // release across every repo that reproduces them.
+    //
+    // `score` is uint64, not the uint8 a scoring-only market would use, because a PERFORMANCE
+    // competition ranks on `PERF_BASE + roi_bps` (around 1e6).
+    bytes32 private constant ENTRY_TYPEHASH = keccak256("Entry(address agent,uint64 score)");
+    bytes32 private constant SETTLEMENT_TYPEHASH = keccak256(
+        "Settlement(bytes32 competitionId,bytes32 receiptHash,uint256 groundTruthValue,Entry[] entries)Entry(address agent,uint64 score)"
+    );
+    bytes32 private immutable DOMAIN_SEPARATOR;
 
     // reentrancy mutex (1 = unlocked, 2 = locked); no OpenZeppelin dependency in this repo
     uint256 private _lock = 1;
@@ -109,6 +130,12 @@ contract SealedCompetition {
     event Cancelled(bytes32 indexed competitionId, uint256 seedReturned);
     event StakeWithdrawn(bytes32 indexed competitionId, address indexed agent, uint256 amount);
     event OperatorSet(address indexed operator, bool allowed);
+    event PrizeAwarded(bytes32 indexed competitionId, address indexed agent, uint256 rank, uint256 amount);
+    event Settled(bytes32 indexed competitionId, bytes32 receiptHash, uint256 winners, uint256 totalPaid);
+    /// The full canonical receipt body (the verify tool fetches this; keccak(receipt) == receiptHash).
+    event ReceiptPublished(bytes32 indexed competitionId, bytes receipt);
+    event PrizeClaimed(address indexed agent, uint256 amount);
+    event RemainingWithdrawn(bytes32 indexed competitionId, address indexed to, uint256 amount);
 
     error NotOwner();
     error NotOperator();
@@ -127,6 +154,14 @@ contract SealedCompetition {
     error NothingStaked();
     error Reentrant();
     error TransferFailed();
+    error AlreadyCancelled();
+    error NotSettled();
+    error NotCreator();
+    error BadTeeSignature();
+    error BadReceipt();
+    error EntryNotJoined();
+    error DuplicateEntry();
+    error NothingOwed();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -146,6 +181,15 @@ contract SealedCompetition {
         teeRegistry = ITeeRegistry(teeRegistry_);
         passport = IPassport(passport_);
         ftsoVerifier = IFtsoFeedVerifier(ftsoVerifier_);
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("SealedCompetition"),
+                keccak256("1"),
+                block.chainid,
+                address(this)
+            )
+        );
     }
 
     function setOperator(address operator, bool allowed) external onlyOwner {
@@ -262,6 +306,181 @@ contract SealedCompetition {
         (bool ok,) = payable(msg.sender).call{value: amount}("");
         if (!ok) revert TransferFailed();
         emit StakeWithdrawn(competitionId, msg.sender, amount);
+    }
+
+    /// Settlement: only the registered TEE can post it. Double verification: (1) recover the EIP-712
+    /// signer and require it is the registered TEE, (2) cross-check `groundTruthValue` against the
+    /// FTSO anchor-feed Merkle proof, so even the TEE cannot fabricate the resolution value.
+    /// `proof` is public oracle data and is NOT part of the signed struct.
+    ///
+    /// Every entry must have actually joined. The reference wrote `joined` and `submissions` and then
+    /// never read either, so the TEE's entry list was trusted wholesale: it could name addresses that
+    /// never staked and never submitted, and those addresses were both paid and written into the
+    /// Passport. Quadra got this for free, because its payout set was built from `participants`,
+    /// which only joining could populate.
+    function settle(
+        bytes32 competitionId,
+        bytes32 receiptHash,
+        uint256 groundTruthValue,
+        EntryInput[] calldata entries,
+        bytes calldata signature,
+        IFtsoFeedVerifier.FeedDataWithProof calldata proof,
+        bytes calldata receipt
+    ) external nonReentrant {
+        Competition storage c = competitions[competitionId];
+        if (!c.exists) revert NoCompetition();
+        if (c.settled) revert AlreadySettled();
+        if (c.cancelled) revert AlreadyCancelled();
+        if (block.timestamp < c.resolveAt) revert TooEarly();
+        if (keccak256(receipt) != receiptHash) revert BadReceipt();
+
+        {
+            address signer = _recoverSettlement(competitionId, receiptHash, groundTruthValue, entries, signature);
+            if (signer == address(0) || signer != teeRegistry.activeTeeWallet()) revert BadTeeSignature();
+        }
+        FtsoLib.checkGroundTruth(ftsoVerifier, groundTruthValue, proof);
+
+        c.settled = true;
+        settledReceiptHash[competitionId] = receiptHash;
+        _recordEntries(competitionId, c.kind, c.category, entries);
+        (uint256 totalPaid, uint256 winners) = _payWinners(competitionId, entries);
+
+        emit ReceiptPublished(competitionId, receipt);
+        emit Settled(competitionId, receiptHash, winners, totalPaid);
+    }
+
+    /// Validate the entry set and fold it into the Passport.
+    ///
+    /// Only SCORING competitions write reputation. A PERFORMANCE metric is around 1e6, and the
+    /// Passport's Bayesian `overall()` is defined over [0,100] — folding a raw ROI figure into that
+    /// track would make the leaderboard meaningless. Performance competitions therefore rank and pay
+    /// but do not yet build reputation; a normalization has to be agreed before they can.
+    function _recordEntries(bytes32 competitionId, uint8 kind, bytes32 category, EntryInput[] calldata entries)
+        private
+    {
+        for (uint256 i = 0; i < entries.length; i++) {
+            address agent = entries[i].agent;
+            if (!joined[competitionId][agent]) revert EntryNotJoined();
+            if (recorded[competitionId][agent]) revert DuplicateEntry();
+            recorded[competitionId][agent] = true;
+
+            if (kind == KIND_SCORING) {
+                // Passport bounds this at 100 itself; the cast is safe because anything above the
+                // ceiling reverts there rather than truncating here.
+                uint64 s = entries[i].score;
+                passport.record(agent, category, s > type(uint8).max ? type(uint8).max : uint8(s));
+            }
+        }
+    }
+
+    /// Rank and credit the winners, following Quadra `release_prizes` exactly:
+    ///  - an entry qualifies when `score >= threshold` (inclusive),
+    ///  - slots are filled in descending score order,
+    ///  - TIES GO TO THE ENTRY SEEN FIRST (Move compared with strict `>` over an insertion-ordered
+    ///    vector, so the incumbent kept the slot),
+    ///  - each share is `floor(prize * pct / 100)` off a snapshot taken BEFORE any payout, so shares
+    ///    do not compound,
+    ///  - dust and the shares of unfilled slots are forfeited to the leftover pool rather than
+    ///    redistributed; the creator reclaims them with `withdrawRemaining`.
+    function _payWinners(bytes32 competitionId, EntryInput[] calldata entries)
+        private
+        returns (uint256 totalPaid, uint256 winners)
+    {
+        Competition storage c = competitions[competitionId];
+        uint256 prize = c.prizePool;
+        c.prizePool = 0; // effects before any credit
+
+        uint256 slots = c.splitPct.length;
+        uint256 n = entries.length;
+        bool[] memory taken = new bool[](n);
+
+        for (uint256 rank = 0; rank < slots; rank++) {
+            uint256 best = type(uint256).max;
+            for (uint256 i = 0; i < n; i++) {
+                if (taken[i]) continue;
+                if (entries[i].score < c.threshold) continue;
+                // strict `>` keeps the earlier entry on a tie
+                if (best == type(uint256).max || entries[i].score > entries[best].score) best = i;
+            }
+            if (best == type(uint256).max) break; // no qualifying entry left; remaining slots lapse
+
+            taken[best] = true;
+            uint256 amount = (prize * c.splitPct[rank]) / PCT_DENOM;
+            if (amount > 0) {
+                owed[entries[best].agent] += amount;
+                totalPaid += amount;
+            }
+            winners += 1;
+            emit PrizeAwarded(competitionId, entries[best].agent, rank, amount);
+        }
+
+        c.prizePool = prize - totalPaid; // dust + lapsed slots stay claimable by the creator
+    }
+
+    /// Withdraw prizes credited by settlement. Winner-initiated, so a payee that cannot receive
+    /// value fails only its own withdrawal.
+    function claimPrize() external nonReentrant {
+        uint256 amount = owed[msg.sender];
+        if (amount == 0) revert NothingOwed();
+        owed[msg.sender] = 0;
+        (bool ok,) = payable(msg.sender).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit PrizeClaimed(msg.sender, amount);
+    }
+
+    /// The creator reclaims what settlement did not pay out: rounding dust plus the shares of any
+    /// winner slots that had no qualifying entry.
+    function withdrawRemaining(bytes32 competitionId) external nonReentrant {
+        Competition storage c = competitions[competitionId];
+        if (!c.exists) revert NoCompetition();
+        if (!c.settled) revert NotSettled();
+        if (msg.sender != c.creator) revert NotCreator();
+
+        uint256 amount = c.prizePool;
+        if (amount == 0) revert NothingOwed();
+        c.prizePool = 0;
+
+        (bool ok,) = payable(c.creator).call{value: amount}("");
+        if (!ok) revert TransferFailed();
+        emit RemainingWithdrawn(competitionId, c.creator, amount);
+    }
+
+    function _recoverSettlement(
+        bytes32 competitionId,
+        bytes32 receiptHash,
+        uint256 groundTruthValue,
+        EntryInput[] calldata entries,
+        bytes calldata signature
+    ) private view returns (address) {
+        bytes32[] memory entryHashes = new bytes32[](entries.length);
+        for (uint256 i = 0; i < entries.length; i++) {
+            entryHashes[i] = keccak256(abi.encode(ENTRY_TYPEHASH, entries[i].agent, entries[i].score));
+        }
+        bytes32 structHash = keccak256(
+            abi.encode(
+                SETTLEMENT_TYPEHASH,
+                competitionId,
+                receiptHash,
+                groundTruthValue,
+                keccak256(abi.encodePacked(entryHashes))
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        return _recover(digest, signature);
+    }
+
+    function _recover(bytes32 digest, bytes calldata sig) private pure returns (address) {
+        if (sig.length != 65) return address(0);
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        if (v < 27) v += 27;
+        return ecrecover(digest, v, r, s);
     }
 
     /// Non-empty and summing to exactly 100 (Quadra `valid_split`, PCT_DENOM = 100).

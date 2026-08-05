@@ -2,6 +2,7 @@
 pragma solidity 0.8.25;
 
 import {IFtsoFeedVerifier} from "./interfaces/IFtsoFeedVerifier.sol";
+import {FtsoLib} from "./FtsoLib.sol";
 
 interface ITeeRegistry {
     function activeTeeWallet() external view returns (address);
@@ -69,6 +70,15 @@ contract JobEscrow {
     mapping(bytes32 => bytes32) public deliveredHash; // jobId => keccak(ciphertext)
     mapping(bytes32 => bytes32) public scoredReceiptHash;
 
+    // --- EIP-712 ---------------------------------------------------------------------------------
+    // Frozen alongside SealedCompetition's typehashes; the TEE signer and the verify tool reproduce
+    // this string exactly. `score` stays uint8 here: a paid job is always graded in [0,100], which
+    // is the range the Passport stores. Only competitions need the wider ranking value.
+    bytes32 private constant JOB_SETTLEMENT_TYPEHASH = keccak256(
+        "JobSettlement(bytes32 jobId,bytes32 receiptHash,address agent,uint8 score,uint256 groundTruthValue)"
+    );
+    bytes32 private immutable DOMAIN_SEPARATOR;
+
     // reentrancy mutex (1 = unlocked, 2 = locked); no OpenZeppelin dependency in this repo
     uint256 private _lock = 1;
 
@@ -91,6 +101,11 @@ contract JobEscrow {
     /// `refundNotDelivered`. Emitted so the omission is visible on chain rather than silent.
     event PassportRecordFailed(bytes32 indexed jobId, address indexed agent);
     event IntakeChanged(address indexed intake);
+    /// The evaluation engine judged the job at lifetime end. Reputation only - no funds move.
+    event JobScored(bytes32 indexed jobId, address indexed agent, uint8 score, bytes32 receiptHash);
+    /// The full canonical receipt body. A job receipt reveals NOTHING private - only the ciphertext
+    /// commitment and the score - so the result stays the user's alpha while its accuracy is public.
+    event ReceiptPublished(bytes32 indexed jobId, bytes receipt);
 
     error NotOwner();
     error NotIntake();
@@ -109,6 +124,10 @@ contract JobEscrow {
     error Reentrant();
     error StaleDelivery();
     error TransferFailed();
+    error AlreadyScored();
+    error NotReleased();
+    error BadTeeSignature();
+    error BadReceipt();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -138,6 +157,15 @@ contract JobEscrow {
         treasury = treasury_;
         feeBps = feeBps_;
         intake = intake_;
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256("JobEscrow"),
+                keccak256("1"),
+                block.chainid,
+                address(this)
+            )
+        );
     }
 
     /// User escrows `msg.value` to hire `agent` for `jobId`. Records the (user, agent) binding ONCE
@@ -280,6 +308,77 @@ contract JobEscrow {
         if (!ok) revert TransferFailed();
 
         emit JobNotDelivered(jobId, agent, user, amount);
+    }
+
+    /// The evaluation engine's verdict, at lifetime end. Double verification: (1) recover the EIP-712
+    /// signer and require it is the registered TEE, (2) cross-check `groundTruthValue` against the
+    /// FTSO anchor-feed Merkle proof, so even the TEE cannot fabricate the resolution value.
+    /// `proof` is public oracle data and is NOT part of the signed struct.
+    ///
+    /// MOVES NO FUNDS. The escrow was settled at release time; this only writes reputation, which is
+    /// why a keeper outage can no longer strand anyone's money. That separation is the reason a
+    /// scoring failure is survivable at all.
+    function scoreJob(
+        bytes32 jobId,
+        bytes32 receiptHash,
+        uint8 score,
+        uint256 groundTruthValue,
+        bytes calldata signature,
+        IFtsoFeedVerifier.FeedDataWithProof calldata proof,
+        bytes calldata receipt
+    ) external {
+        Job storage j = jobs[jobId];
+        if (j.user == address(0)) revert NoJob();
+        if (j.scored) revert AlreadyScored();
+        if (!j.released) revert NotReleased(); // an unpaid job is refunded + scored 0, not scored here
+        if (block.timestamp < j.lifetimeEnd) revert TooEarly();
+        if (keccak256(receipt) != receiptHash) revert BadReceipt();
+
+        {
+            address signer = _recoverJobSettlement(jobId, receiptHash, j.agent, score, groundTruthValue, signature);
+            if (signer == address(0) || signer != teeRegistry.activeTeeWallet()) revert BadTeeSignature();
+        }
+        FtsoLib.checkGroundTruth(ftsoVerifier, groundTruthValue, proof);
+
+        _finishScore(jobId, score, receiptHash, receipt);
+    }
+
+    /// Effects tail of scoreJob. Isolated so scoreJob stays within the stack limit.
+    function _finishScore(bytes32 jobId, uint8 score, bytes32 receiptHash, bytes calldata receipt) private {
+        Job storage j = jobs[jobId];
+        j.scored = true;
+        scoredReceiptHash[jobId] = receiptHash;
+        passport.record(j.agent, j.category, score);
+        emit ReceiptPublished(jobId, receipt);
+        emit JobScored(jobId, j.agent, score, receiptHash);
+    }
+
+    function _recoverJobSettlement(
+        bytes32 jobId,
+        bytes32 receiptHash,
+        address agent,
+        uint8 score,
+        uint256 groundTruthValue,
+        bytes calldata signature
+    ) private view returns (address) {
+        bytes32 structHash =
+            keccak256(abi.encode(JOB_SETTLEMENT_TYPEHASH, jobId, receiptHash, agent, score, groundTruthValue));
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        return _recover(digest, signature);
+    }
+
+    function _recover(bytes32 digest, bytes calldata sig) private pure returns (address) {
+        if (sig.length != 65) return address(0);
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := calldataload(sig.offset)
+            s := calldataload(add(sig.offset, 32))
+            v := byte(0, calldataload(add(sig.offset, 64)))
+        }
+        if (v < 27) v += 27;
+        return ecrecover(digest, v, r, s);
     }
 
     function setFee(uint16 feeBps_, address treasury_) external onlyOwner {
