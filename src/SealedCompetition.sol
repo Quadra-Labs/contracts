@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.25;
 
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IFtsoFeedVerifier} from "./interfaces/IFtsoFeedVerifier.sol";
 import {Ownable2Step} from "./Ownable2Step.sol";
 import {SignatureLib} from "./SignatureLib.sol";
+import {TeeActionResult} from "./TeeActionResult.sol";
 import {FtsoLib} from "./FtsoLib.sol";
 
 interface ITeeRegistry {
@@ -11,7 +14,7 @@ interface ITeeRegistry {
 }
 
 interface IPassport {
-    function record(address agent, bytes32 category, uint8 score) external;
+    function record(address agent, bytes32 category, uint8 score, bytes32 sourceId) external;
 }
 
 /// @title SealedCompetition
@@ -34,6 +37,8 @@ interface IPassport {
 /// Entry typehash, so widening it later would mean changing this contract, the TEE signer and the
 /// verify tool in one atomic release.
 contract SealedCompetition is Ownable2Step {
+    using SafeERC20 for IERC20;
+
     struct Competition {
         string evaluatorId;
         bytes32 category; // keccak256(evaluatorId), the Passport key
@@ -41,7 +46,7 @@ contract SealedCompetition is Ownable2Step {
         uint256 stake; // what each agent must post to join
         uint256 seedPrize; // the creator's own funding, refundable if the competition is cancelled
         uint256 stakedTotal; // the sum of joiner stakes, tracked apart from the seed
-        uint256 prizePool; // native held for this competition == seedPrize + sum(staked)
+        uint256 prizePool; // QUADRA held for this competition == seedPrize + sum(staked)
         uint64 resolveAt;
         uint64 threshold; // entries ranking below this are eliminated from the payout
         bool exists;
@@ -76,6 +81,21 @@ contract SealedCompetition is Ownable2Step {
     /// and the creator's prize forever.
     uint64 public constant CANCEL_WINDOW = 3 days;
 
+    /// Caps on the two lengths that drive the settlement loop, which is O(slots x entries).
+    ///
+    /// Without them a competition can be created that no one can ever settle: the payout loop runs
+    /// out of gas, `settle` reverts every time, and because settlement is the only way funds leave,
+    /// the prize and every stake are locked until the cancel window opens. Rejecting the bad
+    /// configuration at creation time is far better than discovering it at resolution.
+    ///
+    /// 16 winner slots is well past any sane split, and 512 entries is more agents than a single
+    /// competition realistically holds. Both are checked where the value enters, not where it is
+    /// consumed.
+    uint256 public constant MAX_WINNER_SLOTS = 16;
+    uint256 public constant MAX_ENTRIES = 512;
+
+    /// QUADRA. Stakes and prizes are denominated in it; gas is still native C2FLR.
+    IERC20 public immutable token;
     ITeeRegistry public immutable teeRegistry;
     IPassport public immutable passport;
     /// The FTSO anchor-feed verifier used to cross-check the signed ground truth. Zero = dev/skip.
@@ -96,10 +116,14 @@ contract SealedCompetition is Ownable2Step {
     /// Agents already folded into this competition's settlement. Set as each entry is processed, so
     /// a repeated agent in `entries[]` cannot take two winner slots or two Passport records.
     mapping(bytes32 => mapping(address => bool)) public recorded;
-    /// Prizes credited but not yet withdrawn. Settlement never pushes value to a winner; it credits
-    /// here and the winner pulls. One winner whose `receive()` reverts would otherwise revert the
-    /// whole settlement transaction, permanently freezing a funded competition.
+    /// Prizes credited but not yet withdrawn. Settlement credits here and the winner pulls, rather
+    /// than pushing to N addresses in a loop. With a plain ERC-20 a transfer cannot run recipient
+    /// code, so this is no longer strictly required to avoid a hostile winner freezing settlement -
+    /// but it also bounds the gas a settlement can consume, and it keeps the payout path identical
+    /// whether or not the token is ever changed for one with transfer hooks.
     mapping(address => uint256) public owed;
+    /// Action ids already consumed by an FCC settlement, so a signed result cannot be relayed twice.
+    mapping(bytes32 => bool) public consumedActionId;
 
     // --- EIP-712 ---------------------------------------------------------------------------------
     // These three strings are the ABI of trust. The TEE signer, this contract and the verify tool
@@ -114,7 +138,7 @@ contract SealedCompetition is Ownable2Step {
     );
     bytes32 private immutable DOMAIN_SEPARATOR;
 
-    // reentrancy mutex (1 = unlocked, 2 = locked); no OpenZeppelin dependency in this repo
+    // reentrancy mutex (1 = unlocked, 2 = locked)
     uint256 private _lock = 1;
 
     event CompetitionCreated(
@@ -124,7 +148,8 @@ contract SealedCompetition is Ownable2Step {
         uint256 stake,
         uint256 seedPrize,
         uint64 resolveAt,
-        uint64 threshold
+        uint64 threshold,
+        address indexed creator
     );
     event Joined(bytes32 indexed competitionId, address indexed agent, uint256 stake);
     event Submitted(bytes32 indexed competitionId, address indexed agent, bytes32 ciphertextHash);
@@ -142,7 +167,6 @@ contract SealedCompetition is Ownable2Step {
     error AlreadyExists();
     error NoCompetition();
     error NotOpen();
-    error BadStake();
     error BadSplit();
     error BadKind();
     error BadResolveAt();
@@ -153,7 +177,6 @@ contract SealedCompetition is Ownable2Step {
     error NotCancelled();
     error NothingStaked();
     error Reentrant();
-    error TransferFailed();
     error AlreadyCancelled();
     error NotSettled();
     error NotCreator();
@@ -162,6 +185,9 @@ contract SealedCompetition is Ownable2Step {
     error EntryNotJoined();
     error DuplicateEntry();
     error NothingOwed();
+    error ActionIdConsumed();
+    error TooManySlots();
+    error TooManyEntries();
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrant();
@@ -170,7 +196,9 @@ contract SealedCompetition is Ownable2Step {
         _lock = 1;
     }
 
-    constructor(address teeRegistry_, address passport_, address ftsoVerifier_) {
+    constructor(address token_, address teeRegistry_, address passport_, address ftsoVerifier_) {
+        if (token_ == address(0)) revert ZeroAddress();
+        token = IERC20(token_);
         operators[msg.sender] = true;
         teeRegistry = ITeeRegistry(teeRegistry_);
         passport = IPassport(passport_);
@@ -205,11 +233,13 @@ contract SealedCompetition is Ownable2Step {
         uint256 stake,
         uint64 resolveAt,
         uint64 threshold,
-        uint16[] calldata splitPct
-    ) external payable {
+        uint16[] calldata splitPct,
+        uint256 prize
+    ) external {
         if (!operators[msg.sender]) revert NotOperator();
         if (competitions[competitionId].exists) revert AlreadyExists();
         if (kind != KIND_SCORING && kind != KIND_PERFORMANCE) revert BadKind();
+        if (splitPct.length > MAX_WINNER_SLOTS) revert TooManySlots();
         if (!_validSplit(splitPct)) revert BadSplit();
         // A competition born already resolvable can never be joined and never settled, so its
         // funding would be stranded: join reverts NotOpen, and the money only leaves through
@@ -221,30 +251,32 @@ contract SealedCompetition is Ownable2Step {
         c.category = keccak256(bytes(evaluatorId));
         c.kind = kind;
         c.stake = stake;
-        c.seedPrize = msg.value;
-        c.prizePool = msg.value;
+        c.seedPrize = prize;
+        c.prizePool = prize;
         c.resolveAt = resolveAt;
         c.threshold = threshold;
         c.exists = true;
         c.creator = msg.sender;
         c.splitPct = splitPct; // calldata -> storage copy
 
-        emit CompetitionCreated(competitionId, evaluatorId, kind, stake, msg.value, resolveAt, threshold);
+        if (prize > 0) token.safeTransferFrom(msg.sender, address(this), prize);
+        emit CompetitionCreated(competitionId, evaluatorId, kind, stake, prize, resolveAt, threshold, msg.sender);
     }
 
-    function join(bytes32 competitionId) external payable {
+    function join(bytes32 competitionId) external {
         Competition storage c = competitions[competitionId];
         if (!c.exists) revert NoCompetition();
         if (block.timestamp >= c.resolveAt) revert NotOpen();
-        if (msg.value != c.stake) revert BadStake();
         if (joined[competitionId][msg.sender]) revert AlreadyJoined();
 
+        uint256 amount = c.stake;
         joined[competitionId][msg.sender] = true;
-        staked[competitionId][msg.sender] = msg.value;
-        c.stakedTotal += msg.value;
-        c.prizePool += msg.value;
+        staked[competitionId][msg.sender] = amount;
+        c.stakedTotal += amount;
+        c.prizePool += amount;
 
-        emit Joined(competitionId, msg.sender, msg.value);
+        if (amount > 0) token.safeTransferFrom(msg.sender, address(this), amount);
+        emit Joined(competitionId, msg.sender, amount);
     }
 
     /// The prediction stays PRIVATE: only its keccak commitment is stored; the ciphertext is in
@@ -276,10 +308,7 @@ contract SealedCompetition is Ownable2Step {
         c.seedPrize = 0;
         c.prizePool -= seed;
 
-        if (seed > 0) {
-            (bool ok,) = payable(c.creator).call{value: seed}("");
-            if (!ok) revert TransferFailed();
-        }
+        if (seed > 0) token.safeTransfer(c.creator, seed);
         emit Cancelled(competitionId, seed);
     }
 
@@ -297,8 +326,7 @@ contract SealedCompetition is Ownable2Step {
         c.stakedTotal -= amount;
         c.prizePool -= amount;
 
-        (bool ok,) = payable(msg.sender).call{value: amount}("");
-        if (!ok) revert TransferFailed();
+        token.safeTransfer(msg.sender, amount);
         emit StakeWithdrawn(competitionId, msg.sender, amount);
     }
 
@@ -334,6 +362,67 @@ contract SealedCompetition is Ownable2Step {
         }
         FtsoLib.checkGroundTruth(ftsoVerifier, groundTruthValue, proof);
 
+        _finishSettle(competitionId, receiptHash, entries, receipt);
+    }
+
+    // --- Flare Confidential Compute settlement ---------------------------------------------------
+    //
+    // Sits alongside the EIP-712 path rather than replacing it: FCC is documented as pre-production,
+    // so the stack keeps settling through the proven path while the extension is stood up.
+
+    /// What the enclave returns for EVALUATION/SETTLE_COMP.
+    struct TeeCompetitionSettlement {
+        bytes32 competitionId;
+        bytes32 receiptHash;
+        uint256 groundTruthValue;
+        EntryInput[] entries;
+        bytes receipt;
+        IFtsoFeedVerifier.FeedDataWithProof proof;
+    }
+
+    /// Settle on an enclave-attested result. Permissionless: the signature is the authority, so
+    /// anyone may relay it and a dead relayer cannot strand a funded competition.
+    function settleFromTee(
+        bytes calldata resultData,
+        bytes32 actionId,
+        string calldata submissionTag,
+        uint8 status,
+        bytes calldata signature
+    ) external nonReentrant {
+        address signer = TeeActionResult.recoverSigner(resultData, actionId, submissionTag, status, signature);
+        if (signer == address(0) || signer != teeRegistry.activeTeeWallet()) revert BadTeeSignature();
+        // Ours, not FCC's: the signed digest covers the chain id but not a verifying contract, so a
+        // result stays valid against any deployment on this chain trusting the same machine.
+        if (consumedActionId[actionId]) revert ActionIdConsumed();
+        consumedActionId[actionId] = true;
+
+        TeeCompetitionSettlement memory s = abi.decode(resultData, (TeeCompetitionSettlement));
+
+        Competition storage c = competitions[s.competitionId];
+        if (!c.exists) revert NoCompetition();
+        if (c.settled) revert AlreadySettled();
+        if (c.cancelled) revert AlreadyCancelled();
+        if (block.timestamp < c.resolveAt) revert TooEarly();
+        if (keccak256(s.receipt) != s.receiptHash) revert BadReceipt();
+        FtsoLib.checkGroundTruth(ftsoVerifier, s.groundTruthValue, s.proof);
+
+        _finishSettle(s.competitionId, s.receiptHash, s.entries, s.receipt);
+    }
+
+    /// Effects tail, shared by both settlement paths.
+    ///
+    /// Takes `memory`, not `calldata`, precisely so there is ONE copy. The EIP-712 path has its
+    /// entries in calldata and Solidity converts on the way in; the FCC path decodes them out of the
+    /// signed blob and already has memory. Two implementations of the payout rules would be two
+    /// things to keep in agreement, and the ranking and threshold logic is exactly where a silent
+    /// divergence would be most expensive.
+    function _finishSettle(
+        bytes32 competitionId,
+        bytes32 receiptHash,
+        EntryInput[] memory entries,
+        bytes memory receipt
+    ) private {
+        Competition storage c = competitions[competitionId];
         c.settled = true;
         settledReceiptHash[competitionId] = receiptHash;
         _recordEntries(competitionId, c.kind, c.category, entries);
@@ -349,9 +438,10 @@ contract SealedCompetition is Ownable2Step {
     /// Passport's Bayesian `overall()` is defined over [0,100] — folding a raw ROI figure into that
     /// track would make the leaderboard meaningless. Performance competitions therefore rank and pay
     /// but do not yet build reputation; a normalization has to be agreed before they can.
-    function _recordEntries(bytes32 competitionId, uint8 kind, bytes32 category, EntryInput[] calldata entries)
+    function _recordEntries(bytes32 competitionId, uint8 kind, bytes32 category, EntryInput[] memory entries)
         private
     {
+        if (entries.length > MAX_ENTRIES) revert TooManyEntries();
         for (uint256 i = 0; i < entries.length; i++) {
             address agent = entries[i].agent;
             if (!joined[competitionId][agent]) revert EntryNotJoined();
@@ -362,7 +452,7 @@ contract SealedCompetition is Ownable2Step {
                 // Passport bounds this at 100 itself; the cast is safe because anything above the
                 // ceiling reverts there rather than truncating here.
                 uint64 s = entries[i].score;
-                passport.record(agent, category, s > type(uint8).max ? type(uint8).max : uint8(s));
+                passport.record(agent, category, s > type(uint8).max ? type(uint8).max : uint8(s), competitionId);
             }
         }
     }
@@ -376,7 +466,7 @@ contract SealedCompetition is Ownable2Step {
     ///    do not compound,
     ///  - dust and the shares of unfilled slots are forfeited to the leftover pool rather than
     ///    redistributed; the creator reclaims them with `withdrawRemaining`.
-    function _payWinners(bytes32 competitionId, EntryInput[] calldata entries)
+    function _payWinners(bytes32 competitionId, EntryInput[] memory entries)
         private
         returns (uint256 totalPaid, uint256 winners)
     {
@@ -417,8 +507,7 @@ contract SealedCompetition is Ownable2Step {
         uint256 amount = owed[msg.sender];
         if (amount == 0) revert NothingOwed();
         owed[msg.sender] = 0;
-        (bool ok,) = payable(msg.sender).call{value: amount}("");
-        if (!ok) revert TransferFailed();
+        token.safeTransfer(msg.sender, amount);
         emit PrizeClaimed(msg.sender, amount);
     }
 
@@ -434,8 +523,7 @@ contract SealedCompetition is Ownable2Step {
         if (amount == 0) revert NothingOwed();
         c.prizePool = 0;
 
-        (bool ok,) = payable(c.creator).call{value: amount}("");
-        if (!ok) revert TransferFailed();
+        token.safeTransfer(c.creator, amount);
         emit RemainingWithdrawn(competitionId, c.creator, amount);
     }
 

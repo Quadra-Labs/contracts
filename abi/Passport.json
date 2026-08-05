@@ -21,7 +21,7 @@
   },
   {
     "type": "function",
-    "name": "agentsIn",
+    "name": "agentCountIn",
     "inputs": [
       {
         "name": "category",
@@ -32,6 +32,35 @@
     "outputs": [
       {
         "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "agentsIn",
+    "inputs": [
+      {
+        "name": "category",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "offset",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "limit",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "page",
         "type": "address[]",
         "internalType": "address[]"
       }
@@ -164,6 +193,11 @@
         "name": "score",
         "type": "uint8",
         "internalType": "uint8"
+      },
+      {
+        "name": "sourceId",
+        "type": "bytes32",
+        "internalType": "bytes32"
       }
     ],
     "outputs": [],
@@ -269,6 +303,12 @@
       },
       {
         "name": "category",
+        "type": "bytes32",
+        "indexed": true,
+        "internalType": "bytes32"
+      },
+      {
+        "name": "sourceId",
         "type": "bytes32",
         "indexed": true,
         "internalType": "bytes32"

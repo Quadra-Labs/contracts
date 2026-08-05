@@ -3,6 +3,11 @@
     "type": "constructor",
     "inputs": [
       {
+        "name": "token_",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
         "name": "teeRegistry_",
         "type": "address",
         "internalType": "address"
@@ -55,6 +60,32 @@
         "name": "",
         "type": "uint8",
         "internalType": "uint8"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_ENTRIES",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_WINNER_SLOTS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "stateMutability": "view"
@@ -180,6 +211,25 @@
   },
   {
     "type": "function",
+    "name": "consumedActionId",
+    "inputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "create",
     "inputs": [
       {
@@ -216,10 +266,15 @@
         "name": "splitPct",
         "type": "uint16[]",
         "internalType": "uint16[]"
+      },
+      {
+        "name": "prize",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "outputs": [],
-    "stateMutability": "payable"
+    "stateMutability": "nonpayable"
   },
   {
     "type": "function",
@@ -264,7 +319,7 @@
       }
     ],
     "outputs": [],
-    "stateMutability": "payable"
+    "stateMutability": "nonpayable"
   },
   {
     "type": "function",
@@ -505,6 +560,39 @@
   },
   {
     "type": "function",
+    "name": "settleFromTee",
+    "inputs": [
+      {
+        "name": "resultData",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "actionId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "submissionTag",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "status",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "signature",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "settledReceiptHash",
     "inputs": [
       {
@@ -597,6 +685,19 @@
         "name": "",
         "type": "address",
         "internalType": "contract ITeeRegistry"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "token",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IERC20"
       }
     ],
     "stateMutability": "view"
@@ -704,6 +805,12 @@
         "type": "uint64",
         "indexed": false,
         "internalType": "uint64"
+      },
+      {
+        "name": "creator",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
       }
     ],
     "anonymous": false
@@ -967,6 +1074,11 @@
   },
   {
     "type": "error",
+    "name": "ActionIdConsumed",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "AlreadyCancelled",
     "inputs": []
   },
@@ -1013,11 +1125,6 @@
   {
     "type": "error",
     "name": "BadSplit",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "BadStake",
     "inputs": []
   },
   {
@@ -1102,12 +1209,28 @@
   },
   {
     "type": "error",
+    "name": "SafeERC20FailedOperation",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "TooEarly",
     "inputs": []
   },
   {
     "type": "error",
-    "name": "TransferFailed",
+    "name": "TooManyEntries",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "TooManySlots",
     "inputs": []
   },
   {

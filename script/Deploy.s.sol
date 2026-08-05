@@ -8,6 +8,7 @@ import {TeeRegistry} from "../src/TeeRegistry.sol";
 import {Passport} from "../src/Passport.sol";
 import {JobEscrow} from "../src/JobEscrow.sol";
 import {SealedCompetition} from "../src/SealedCompetition.sol";
+import {QuadraToken} from "../src/QuadraToken.sol";
 import {IFlareContractRegistry} from "../src/interfaces/IFlareContractRegistry.sol";
 
 /// @title Deploy
@@ -61,12 +62,19 @@ contract Deploy is Script {
         if (pk != 0) vm.startBroadcast(pk);
         else vm.startBroadcast();
 
+        // QUADRA_TOKEN lets a redeploy of the markets reuse the existing token, so agent balances
+        // and the fee history survive. Unset mints a fresh supply to the treasury.
+        address tokenAddr = vm.envOr("QUADRA_TOKEN", address(0));
+        if (tokenAddr == address(0)) {
+            tokenAddr = address(new QuadraToken(treasury));
+        }
+
         TeeRegistry registry = new TeeRegistry(digest, vtpmVerifier);
         Passport passport = new Passport();
         JobEscrow jobEscrow =
-            new JobEscrow(address(registry), address(passport), treasury, feeBps, ftsoVerifier, intake);
+            new JobEscrow(tokenAddr, address(registry), address(passport), treasury, feeBps, ftsoVerifier, intake);
         SealedCompetition competition =
-            new SealedCompetition(address(registry), address(passport), ftsoVerifier);
+            new SealedCompetition(tokenAddr, address(registry), address(passport), ftsoVerifier);
 
         passport.setRecorder(address(jobEscrow), true);
         passport.setRecorder(address(competition), true);
@@ -83,8 +91,9 @@ contract Deploy is Script {
 
         vm.stopBroadcast();
 
-        _write(address(registry), address(passport), address(jobEscrow), address(competition), treasury, intake, ftsoVerifier);
+        _write(tokenAddr, address(registry), address(passport), address(jobEscrow), address(competition), treasury, intake, ftsoVerifier);
 
+        console2.log("quadraToken       ", tokenAddr);
         console2.log("teeRegistry       ", address(registry));
         console2.log("passport          ", address(passport));
         console2.log("jobEscrow         ", address(jobEscrow));
@@ -111,6 +120,7 @@ contract Deploy is Script {
     /// `evaluationInstructionSender` is present but empty until the Flare Confidential Compute
     /// layer is deployed - the key exists from the start so consumers can parse one stable shape.
     function _write(
+        address quadraToken,
         address registry,
         address passport,
         address jobEscrow,
@@ -123,7 +133,9 @@ contract Deploy is Script {
         string memory json = string.concat(
             '{\n  "chainId": ',
             vm.toString(block.chainid),
-            ',\n  "teeRegistry": "',
+            ',\n  "quadraToken": "',
+            vm.toString(quadraToken),
+            '",\n  "teeRegistry": "',
             vm.toString(registry),
             '",\n  "passport": "',
             vm.toString(passport),

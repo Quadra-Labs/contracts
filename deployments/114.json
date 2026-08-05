@@ -1,0 +1,12 @@
+{
+  "chainId": 114,
+  "quadraToken": "0xeB4C1BfeB472711961bb14Ca4050582EFEe925d0",
+  "teeRegistry": "0xe7C993BaAE035B40da4b7FFcCAA4F7F6D70Bbce9",
+  "passport": "0x73372478b9f3673B263c08A5f239188c3BCCCC7a",
+  "jobEscrow": "0x355145f9d6020E98D94E6249C16fb0fabfa38641",
+  "sealedCompetition": "0xCA0078F011492B8B8aa7C73dCe03ba59045FFbc6",
+  "evaluationInstructionSender": "",
+  "treasury": "0xE01dcfdfcB48D69bF5Bb017f2d8569c0005cB108",
+  "intake": "0xE01dcfdfcB48D69bF5Bb017f2d8569c0005cB108",
+  "ftsoVerifier": "0xC4e9c78EA53db782E28f28Fdf80BaF59336B304d"
+}

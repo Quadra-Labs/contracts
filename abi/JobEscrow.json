@@ -3,6 +3,11 @@
     "type": "constructor",
     "inputs": [
       {
+        "name": "token_",
+        "type": "address",
+        "internalType": "address"
+      },
+      {
         "name": "teeRegistry_",
         "type": "address",
         "internalType": "address"
@@ -41,6 +46,25 @@
     "inputs": [],
     "outputs": [],
     "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "consumedActionId",
+    "inputs": [
+      {
+        "name": "",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      }
+    ],
+    "outputs": [
+      {
+        "name": "",
+        "type": "bool",
+        "internalType": "bool"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -241,10 +265,15 @@
         "name": "lifetimeEnd",
         "type": "uint64",
         "internalType": "uint64"
+      },
+      {
+        "name": "cost",
+        "type": "uint256",
+        "internalType": "uint256"
       }
     ],
     "outputs": [],
-    "stateMutability": "payable"
+    "stateMutability": "nonpayable"
   },
   {
     "type": "function",
@@ -285,6 +314,39 @@
         "name": "expectedDeliveryHash",
         "type": "bytes32",
         "internalType": "bytes32"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "releasePaymentFromTee",
+    "inputs": [
+      {
+        "name": "resultData",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "actionId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "submissionTag",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "status",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "signature",
+        "type": "bytes",
+        "internalType": "bytes"
       }
     ],
     "outputs": [],
@@ -374,6 +436,39 @@
   },
   {
     "type": "function",
+    "name": "scoreJobFromTee",
+    "inputs": [
+      {
+        "name": "resultData",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "actionId",
+        "type": "bytes32",
+        "internalType": "bytes32"
+      },
+      {
+        "name": "submissionTag",
+        "type": "string",
+        "internalType": "string"
+      },
+      {
+        "name": "status",
+        "type": "uint8",
+        "internalType": "uint8"
+      },
+      {
+        "name": "signature",
+        "type": "bytes",
+        "internalType": "bytes"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "scoredReceiptHash",
     "inputs": [
       {
@@ -437,6 +532,19 @@
   },
   {
     "type": "function",
+    "name": "token",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "address",
+        "internalType": "contract IERC20"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "transferOwnership",
     "inputs": [
       {
@@ -482,6 +590,25 @@
         "type": "bytes32",
         "indexed": false,
         "internalType": "bytes32"
+      }
+    ],
+    "anonymous": false
+  },
+  {
+    "type": "event",
+    "name": "FeeChanged",
+    "inputs": [
+      {
+        "name": "feeBps",
+        "type": "uint16",
+        "indexed": false,
+        "internalType": "uint16"
+      },
+      {
+        "name": "treasury",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
       }
     ],
     "anonymous": false
@@ -731,6 +858,11 @@
   },
   {
     "type": "error",
+    "name": "ActionIdConsumed",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "AlreadyReleased",
     "inputs": []
   },
@@ -777,6 +909,11 @@
   {
     "type": "error",
     "name": "DeadlinePassed",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "DeliveryRejected",
     "inputs": []
   },
   {
@@ -841,17 +978,23 @@
   },
   {
     "type": "error",
+    "name": "SafeERC20FailedOperation",
+    "inputs": [
+      {
+        "name": "token",
+        "type": "address",
+        "internalType": "address"
+      }
+    ]
+  },
+  {
+    "type": "error",
     "name": "StaleDelivery",
     "inputs": []
   },
   {
     "type": "error",
     "name": "TooEarly",
-    "inputs": []
-  },
-  {
-    "type": "error",
-    "name": "TransferFailed",
     "inputs": []
   },
   {

@@ -40,7 +40,11 @@ contract Passport is Ownable2Step {
     mapping(bytes32 => address[]) private categoryAgents;
     mapping(bytes32 => mapping(address => bool)) private inCategory;
 
-    event Recorded(address indexed agent, bytes32 indexed category, uint8 score);
+    /// `sourceId` is the jobId or competitionId the score came from. Without it a score cannot be
+    /// traced back on chain to the settlement that produced it, which makes the reputation
+    /// unauditable: you can see that an agent scored 80, but not for what. Quadra's `ScoreRecorded`
+    /// carried `job_id` for exactly this reason.
+    event Recorded(address indexed agent, bytes32 indexed category, bytes32 indexed sourceId, uint8 score);
     event RecorderSet(address indexed recorder, bool allowed);
 
     error NotRecorder();
@@ -59,7 +63,7 @@ contract Passport is Ownable2Step {
     /// scorer is wrong, and silently clamping would write a plausible-looking record derived from
     /// a value nobody signed off on. Callers that batch (SealedCompetition.settle) therefore fail
     /// the whole settlement on bad data instead of paying against it.
-    function record(address agent, bytes32 category, uint8 score) external {
+    function record(address agent, bytes32 category, uint8 score, bytes32 sourceId) external {
         if (!recorders[msg.sender]) revert NotRecorder();
         if (score > MAX_SCORE) revert BadScore();
         Track storage t = tracks[agent][category];
@@ -70,7 +74,7 @@ contract Passport is Ownable2Step {
             inCategory[category][agent] = true;
             categoryAgents[category].push(agent);
         }
-        emit Recorded(agent, category, score);
+        emit Recorded(agent, category, sourceId, score);
     }
 
     function getTrack(address agent, bytes32 category)
@@ -89,12 +93,40 @@ contract Passport is Ownable2Step {
         return ((uint256(t.totalScore) + PRIOR_MEAN * CONFIDENCE) * 100) / (uint256(t.scored) + CONFIDENCE);
     }
 
-    /// Every agent that has a track in `category` (for off-chain leaderboards / sorting).
-    function agentsIn(bytes32 category) external view returns (address[] memory) {
-        return categoryAgents[category];
+    /// How many agents have a track in `category`. Read this before paging through `agentsIn`.
+    function agentCountIn(bytes32 category) external view returns (uint256) {
+        return categoryAgents[category].length;
+    }
+
+    /// A page of the agents with a track in `category`, for off-chain leaderboards.
+    ///
+    /// Paginated rather than returning the whole set: the list grows without bound as agents join,
+    /// and an unbounded return eventually exceeds the node's `eth_call` limit - at which point the
+    /// leaderboard simply stops loading, with no way to ask for less. `limit` is clamped to what
+    /// remains, so `agentsIn(cat, 0, type(uint256).max)` is a safe "give me everything" for a
+    /// category small enough to fit.
+    function agentsIn(bytes32 category, uint256 offset, uint256 limit)
+        external
+        view
+        returns (address[] memory page)
+    {
+        address[] storage list = categoryAgents[category];
+        if (offset >= list.length) return new address[](0);
+        uint256 remaining = list.length - offset;
+        uint256 n = limit < remaining ? limit : remaining;
+        page = new address[](n);
+        for (uint256 i = 0; i < n; i++) {
+            page[i] = list[offset + i];
+        }
     }
 
     /// 1-based rank of an agent within a category by `overall` (ties share a rank). 0 if unranked.
+    ///
+    /// O(n) storage reads in the category size, and only ever meant to be called off-chain, where
+    /// it costs nothing but the node's call budget. It is deliberately NOT used by any state-
+    /// changing function, so a large category can never make a settlement unsettleable. Past the
+    /// point where this stops returning, build the leaderboard from `Recorded` events instead -
+    /// which is what an indexer should be doing anyway.
     function rank(address agent, bytes32 category) external view returns (uint256) {
         if (!inCategory[category][agent]) return 0;
         uint256 mine = overall(agent, category);

@@ -3,6 +3,7 @@ pragma solidity 0.8.25;
 
 import {Ownable2Step} from "./Ownable2Step.sol";
 import {IVtpmAttestation} from "./interfaces/IVtpmAttestation.sol";
+import {ITeeMachineRegistry} from "./interfaces/ITeeMachineRegistry.sol";
 
 /// @title TeeRegistry
 /// @notice Binds the scorer TEE's on-chain identity (an secp256k1 wallet generated inside the
@@ -36,11 +37,23 @@ contract TeeRegistry is Ownable2Step {
     /// The on-chain vTPM attestation verifier. Zero = attestation-gated `register` disabled (dev).
     IVtpmAttestation public immutable vtpm;
 
+    // --- Flare Confidential Compute ------------------------------------------------------------
+    /// Flare's TEE machine registry. Zero = FCC mode not configured yet.
+    ITeeMachineRegistry public teeMachineRegistry;
+    /// Our extension id, as allocated by `TeeExtensionRegistry` when the extension was registered.
+    uint256 public fccExtensionId;
+    /// True once `activeTeeWallet` was bound through the FCC path rather than vTPM or dev.
+    bool public fccMode;
+
     event TeeRegistered(address indexed teeWallet, string imageDigest);
+    event FccTeeRegistered(address indexed teeMachine, uint256 extensionId);
+    event FccConfigured(address indexed teeMachineRegistry, uint256 extensionId);
 
     error VtpmUnset();
     error BadImageDigest();
     error BadNonce();
+    error FccUnset();
+    error NoTeeAvailable();
 
     constructor(string memory expectedImageDigest_, address vtpm_) {
         expectedImageDigest = expectedImageDigest_;
@@ -83,6 +96,42 @@ contract TeeRegistry is Ownable2Step {
         activeTeeWallet = teeWallet;
         activeTeePublicKey = teePublicKey;
         emit TeeRegistered(teeWallet, imageDigest);
+    }
+
+    /// Point the registry at Flare's TEE machine registry and our allocated extension id. Owner-only,
+    /// and re-settable: if the `FlareTeeManager` diamond is redeployed every registration is wiped
+    /// and the extension is re-registered under a fresh id, which this has to be able to follow.
+    function configureFcc(address teeMachineRegistry_, uint256 extensionId_) external onlyOwner {
+        if (teeMachineRegistry_ == address(0)) revert ZeroAddress();
+        teeMachineRegistry = ITeeMachineRegistry(teeMachineRegistry_);
+        fccExtensionId = extensionId_;
+        emit FccConfigured(teeMachineRegistry_, extensionId_);
+    }
+
+    /// FCC path: bind `teeMachine` as the trusted settlement signer.
+    ///
+    /// Deliberately NOT re-deriving attestation here. Under FCC the enclave's code hash is
+    /// whitelisted via `allow-tee-version` and the machine is admitted by `register-tee` only after
+    /// Flare's data providers accept its Confidential Space attestation. A machine serving our
+    /// extension has already passed all of that; re-checking it here would mean re-implementing
+    /// Flare's attestation consensus in this contract, which is exactly the burden the migration
+    /// sheds.
+    ///
+    /// The `getRandomTeeIds` call is a liveness assertion, not a membership proof: it fails fast if
+    /// the extension has no serving machines at all (a mis-set `fccExtensionId`, or a wiped
+    /// registry), which is the mistake actually worth catching here. It does NOT prove that
+    /// `teeMachine` specifically serves us, so an owner typo still binds the wrong signer - which is
+    /// why this is owner-gated rather than permissionless.
+    function registerFccTee(address teeMachine, bytes calldata teePublicKey) external onlyOwner {
+        if (address(teeMachineRegistry) == address(0)) revert FccUnset();
+        if (teeMachine == address(0)) revert ZeroAddress();
+        if (teeMachineRegistry.getRandomTeeIds(fccExtensionId, 1).length == 0) revert NoTeeAvailable();
+
+        activeTeeWallet = teeMachine;
+        activeTeePublicKey = teePublicKey;
+        fccMode = true;
+        emit FccTeeRegistered(teeMachine, fccExtensionId);
+        emit TeeRegistered(teeMachine, expectedImageDigest);
     }
 
     /// The attestation nonce the enclave MUST request when fetching its token, binding the token to

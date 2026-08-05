@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.25;
 
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "openzeppelin-contracts/contracts/token/ERC20/utils/SafeERC20.sol";
 import {IFtsoFeedVerifier} from "./interfaces/IFtsoFeedVerifier.sol";
 import {Ownable2Step} from "./Ownable2Step.sol";
 import {SignatureLib} from "./SignatureLib.sol";
+import {TeeActionResult} from "./TeeActionResult.sol";
 import {FtsoLib} from "./FtsoLib.sol";
 
 interface ITeeRegistry {
@@ -11,7 +14,7 @@ interface ITeeRegistry {
 }
 
 interface IPassport {
-    function record(address agent, bytes32 category, uint8 score) external;
+    function record(address agent, bytes32 category, uint8 score, bytes32 sourceId) external;
 }
 
 /// @title JobEscrow
@@ -19,7 +22,7 @@ interface IPassport {
 ///
 /// PAYMENT AND SCORING ARE SEPARATE CONCERNS, on separate clocks. This is the whole design:
 ///
-///   1. `payForJob`      the user escrows native C2FLR to hire ONE agent, and fixes TWO deadlines:
+///   1. `payForJob`      the user escrows QUADRA to hire ONE agent, and fixes TWO deadlines:
 ///                       `deliveryDeadline` (how long the agent has to hand something in) and
 ///                       `lifetimeEnd` (when the forecast is judged).
 ///   2. `deliver`        the agent commits the keccak of its dual-encrypted result.
@@ -42,6 +45,8 @@ interface IPassport {
 /// Sui's `Clock` is millisecond-resolution. `block.timestamp` is seconds, so every deadline here is
 /// a unix SECOND. Carrying a millisecond literal across would turn a 30-minute window into 500 hours.
 contract JobEscrow is Ownable2Step {
+    using SafeERC20 for IERC20;
+
     struct Job {
         address user;
         address agent;
@@ -54,6 +59,8 @@ contract JobEscrow is Ownable2Step {
         bool scored; // the Passport has been written for this job
     }
 
+    /// QUADRA. Jobs are escrowed and paid in it; gas is still native C2FLR.
+    IERC20 public immutable token;
     ITeeRegistry public immutable teeRegistry;
     IPassport public immutable passport;
     /// The FTSO anchor-feed verifier used to cross-check the signed ground truth. Zero = dev/skip.
@@ -70,6 +77,8 @@ contract JobEscrow is Ownable2Step {
     mapping(bytes32 => Job) public jobs;
     mapping(bytes32 => bytes32) public deliveredHash; // jobId => keccak(ciphertext)
     mapping(bytes32 => bytes32) public scoredReceiptHash;
+    /// Action ids already consumed by an FCC settlement, so a signed result cannot be relayed twice.
+    mapping(bytes32 => bool) public consumedActionId;
 
     // --- EIP-712 ---------------------------------------------------------------------------------
     // Frozen alongside SealedCompetition's typehashes; the TEE signer and the verify tool reproduce
@@ -80,7 +89,7 @@ contract JobEscrow is Ownable2Step {
     );
     bytes32 private immutable DOMAIN_SEPARATOR;
 
-    // reentrancy mutex (1 = unlocked, 2 = locked); no OpenZeppelin dependency in this repo
+    // reentrancy mutex (1 = unlocked, 2 = locked)
     uint256 private _lock = 1;
 
     event JobPaid(
@@ -102,6 +111,9 @@ contract JobEscrow is Ownable2Step {
     /// `refundNotDelivered`. Emitted so the omission is visible on chain rather than silent.
     event PassportRecordFailed(bytes32 indexed jobId, address indexed agent);
     event IntakeChanged(address indexed intake);
+    /// The platform fee or its recipient moved. Silent before: a fee change is read at RELEASE time,
+    /// not fixed at payment time, so a user has no on-chain record of the terms shifting under them.
+    event FeeChanged(uint16 feeBps, address indexed treasury);
     /// The evaluation engine judged the job at lifetime end. Reputation only - no funds move.
     event JobScored(bytes32 indexed jobId, address indexed agent, uint8 score, bytes32 receiptHash);
     /// The full canonical receipt body. A job receipt reveals NOTHING private - only the ciphertext
@@ -123,11 +135,12 @@ contract JobEscrow is Ownable2Step {
     error DeadlinePassed();
     error Reentrant();
     error StaleDelivery();
-    error TransferFailed();
     error AlreadyScored();
     error NotReleased();
     error BadTeeSignature();
     error BadReceipt();
+    error DeliveryRejected();
+    error ActionIdConsumed();
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrant();
@@ -137,6 +150,7 @@ contract JobEscrow is Ownable2Step {
     }
 
     constructor(
+        address token_,
         address teeRegistry_,
         address passport_,
         address treasury_,
@@ -145,6 +159,8 @@ contract JobEscrow is Ownable2Step {
         address intake_
     ) {
         if (feeBps_ > BPS_DENOM) revert BadFee();
+        if (token_ == address(0)) revert ZeroAddress();
+        token = IERC20(token_);
         teeRegistry = ITeeRegistry(teeRegistry_);
         passport = IPassport(passport_);
         ftsoVerifier = IFtsoFeedVerifier(ftsoVerifier_);
@@ -162,7 +178,7 @@ contract JobEscrow is Ownable2Step {
         );
     }
 
-    /// User escrows `msg.value` to hire `agent` for `jobId`. Records the (user, agent) binding ONCE
+    /// User escrows `cost` QUADRA to hire `agent` for `jobId` (approve this contract first). Records the (user, agent) binding ONCE
     /// per jobId — it can never be rebound, so the job's access can't be hijacked (mirrors Quadra
     /// `job_access::record`, which asserts `!access.contains(job_id)` with EAlreadyBound).
     /// `userPubKey` + `params` are emitted (not stored) so the agent, watching JobPaid, can
@@ -177,25 +193,27 @@ contract JobEscrow is Ownable2Step {
         bytes calldata params,
         bytes calldata userPubKey,
         uint64 deliveryDeadline,
-        uint64 lifetimeEnd
-    ) external payable {
+        uint64 lifetimeEnd,
+        uint256 cost
+    ) external {
         if (jobs[jobId].user != address(0)) revert JobExists();
         if (agent == address(0)) revert BadAgent();
-        if (msg.value == 0) revert NoEscrow();
+        if (cost == 0) revert NoEscrow();
         if (deliveryDeadline <= block.timestamp) revert BadDeadline();
         if (lifetimeEnd < deliveryDeadline) revert BadDeadline();
         jobs[jobId] = Job({
             user: msg.sender,
             agent: agent,
             category: keccak256(bytes(evaluatorId)),
-            escrow: msg.value,
+            escrow: cost,
             deliveryDeadline: deliveryDeadline,
             lifetimeEnd: lifetimeEnd,
             delivered: false,
             released: false,
             scored: false
         });
-        _emitJobPaid(jobId, agent, evaluatorId, params, userPubKey, deliveryDeadline, lifetimeEnd);
+        token.safeTransferFrom(msg.sender, address(this), cost);
+        _emitJobPaid(jobId, agent, evaluatorId, params, userPubKey, deliveryDeadline, lifetimeEnd, cost);
     }
 
     /// JobPaid carries nine fields, which overflows the stack if emitted inline alongside the struct
@@ -207,11 +225,10 @@ contract JobEscrow is Ownable2Step {
         bytes calldata params,
         bytes calldata userPubKey,
         uint64 deliveryDeadline,
-        uint64 lifetimeEnd
+        uint64 lifetimeEnd,
+        uint256 cost
     ) private {
-        emit JobPaid(
-            jobId, msg.sender, agent, evaluatorId, msg.value, deliveryDeadline, lifetimeEnd, userPubKey, params
-        );
+        emit JobPaid(jobId, msg.sender, agent, evaluatorId, cost, deliveryDeadline, lifetimeEnd, userPubKey, params);
     }
 
     /// The agent submits the dual-encrypted (to user + TEE) result. Only its keccak commitment is
@@ -245,6 +262,17 @@ contract JobEscrow is Ownable2Step {
         if (!j.delivered) revert NotDelivered();
         if (deliveredHash[jobId] != expectedDeliveryHash) revert StaleDelivery();
 
+        _release(jobId);
+    }
+
+    /// The payout itself, shared by the role path and the enclave-attested path.
+    ///
+    /// Deliberately one implementation rather than two: this is the only code that moves a user's
+    /// escrow, and two copies of a money path drift. The reference had exactly that - the FCC path
+    /// re-implemented the fee split inline instead of calling the role path's.
+    function _release(bytes32 jobId) private {
+        Job storage j = jobs[jobId];
+
         // Effects before interactions.
         uint256 amount = j.escrow;
         j.escrow = 0;
@@ -255,12 +283,8 @@ contract JobEscrow is Ownable2Step {
         // direction Quadra `intake::release_payment` rounded.
         uint256 fee = (amount * feeBps) / BPS_DENOM;
         uint256 agentAmount = amount - fee;
-        if (fee > 0) {
-            (bool okFee,) = payable(treasury).call{value: fee}("");
-            if (!okFee) revert TransferFailed();
-        }
-        (bool okAgent,) = payable(agent).call{value: agentAmount}("");
-        if (!okAgent) revert TransferFailed();
+        if (fee > 0) token.safeTransfer(treasury, fee);
+        token.safeTransfer(agent, agentAmount);
 
         emit PaymentReleased(jobId, agent, agentAmount, fee);
     }
@@ -294,12 +318,11 @@ contract JobEscrow is Ownable2Step {
         bytes32 category = j.category;
 
         // Interactions.
-        try passport.record(agent, category, 0) {}
+        try passport.record(agent, category, 0, jobId) {}
         catch {
             emit PassportRecordFailed(jobId, agent);
         }
-        (bool ok,) = payable(user).call{value: amount}("");
-        if (!ok) revert TransferFailed();
+        token.safeTransfer(user, amount);
 
         emit JobNotDelivered(jobId, agent, user, amount);
     }
@@ -342,7 +365,7 @@ contract JobEscrow is Ownable2Step {
         Job storage j = jobs[jobId];
         j.scored = true;
         scoredReceiptHash[jobId] = receiptHash;
-        passport.record(j.agent, j.category, score);
+        passport.record(j.agent, j.category, score, jobId);
         emit ReceiptPublished(jobId, receipt);
         emit JobScored(jobId, j.agent, score, receiptHash);
     }
@@ -362,10 +385,103 @@ contract JobEscrow is Ownable2Step {
     }
 
 
+    // --- Flare Confidential Compute settlement ---------------------------------------------------
+    //
+    // These sit ALONGSIDE the EIP-712 paths rather than replacing them, on purpose: FCC is
+    // documented as pre-production, so the stack keeps settling through the proven path while the
+    // extension is stood up. Both converge on `teeRegistry.activeTeeWallet()`, so switching modes is
+    // a registry call, not a redeployment.
+
+    /// What the enclave returns for EVALUATION/VALIDATE.
+    struct TeeValidation {
+        bytes32 jobId;
+        bytes32 deliveryHash;
+        bool valid;
+        string reason;
+    }
+
+    /// What the enclave returns for EVALUATION/SCORE_JOB.
+    struct TeeJobScore {
+        bytes32 jobId;
+        bytes32 receiptHash;
+        uint8 score;
+        uint256 groundTruthValue;
+        bytes receipt;
+        IFtsoFeedVerifier.FeedDataWithProof proof;
+    }
+
+    /// Release the escrow on an enclave-attested validation. Permissionless: the signature is the
+    /// authority, so anyone may relay it and a dead relayer cannot strand the agent's payment.
+    function releasePaymentFromTee(
+        bytes calldata resultData,
+        bytes32 actionId,
+        string calldata submissionTag,
+        uint8 status,
+        bytes calldata signature
+    ) external nonReentrant {
+        _requireTee(resultData, actionId, submissionTag, status, signature);
+        TeeValidation memory v = abi.decode(resultData, (TeeValidation));
+
+        Job storage j = jobs[v.jobId];
+        if (j.user == address(0)) revert NoJob();
+        if (j.released) revert AlreadyReleased();
+        if (!j.delivered) revert NotDelivered();
+        if (v.deliveryHash != deliveredHash[v.jobId]) revert StaleDelivery();
+        if (!v.valid) revert DeliveryRejected();
+
+        _release(v.jobId);
+    }
+
+    /// Record an enclave-attested score. Moves no funds.
+    function scoreJobFromTee(
+        bytes calldata resultData,
+        bytes32 actionId,
+        string calldata submissionTag,
+        uint8 status,
+        bytes calldata signature
+    ) external {
+        _requireTee(resultData, actionId, submissionTag, status, signature);
+        TeeJobScore memory s = abi.decode(resultData, (TeeJobScore));
+
+        Job storage j = jobs[s.jobId];
+        if (j.user == address(0)) revert NoJob();
+        if (j.scored) revert AlreadyScored();
+        if (!j.released) revert NotReleased();
+        if (block.timestamp < j.lifetimeEnd) revert TooEarly();
+        if (keccak256(s.receipt) != s.receiptHash) revert BadReceipt();
+        FtsoLib.checkGroundTruth(ftsoVerifier, s.groundTruthValue, s.proof);
+
+        j.scored = true;
+        scoredReceiptHash[s.jobId] = s.receiptHash;
+        passport.record(j.agent, j.category, s.score, s.jobId);
+        emit ReceiptPublished(s.jobId, s.receipt);
+        emit JobScored(s.jobId, j.agent, s.score, s.receiptHash);
+    }
+
+    /// Verify the result came from the registered TEE machine, and burn its action id.
+    ///
+    /// The action id guard is ours, not FCC's. The signed digest covers the chain id but NOT a
+    /// verifying contract, so a result stays valid against any deployment on this chain that trusts
+    /// the same machine. Consuming the id per deployment closes replay within this one, and the
+    /// idempotency flags (`released`, `scored`) close the rest.
+    function _requireTee(
+        bytes calldata resultData,
+        bytes32 actionId,
+        string calldata submissionTag,
+        uint8 status,
+        bytes calldata signature
+    ) private {
+        address signer = TeeActionResult.recoverSigner(resultData, actionId, submissionTag, status, signature);
+        if (signer == address(0) || signer != teeRegistry.activeTeeWallet()) revert BadTeeSignature();
+        if (consumedActionId[actionId]) revert ActionIdConsumed();
+        consumedActionId[actionId] = true;
+    }
+
     function setFee(uint16 feeBps_, address treasury_) external onlyOwner {
         if (feeBps_ > BPS_DENOM) revert BadFee();
         feeBps = feeBps_;
         treasury = treasury_;
+        emit FeeChanged(feeBps_, treasury_);
     }
 
     function setIntake(address intake_) external onlyOwner {

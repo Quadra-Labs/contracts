@@ -4,6 +4,7 @@ pragma solidity 0.8.25;
 import {Script} from "forge-std/Script.sol";
 import {console2} from "forge-std/console2.sol";
 import {SealedCompetition} from "../src/SealedCompetition.sol";
+import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 
 /// @title CreateCompetition
 /// @notice Opens a competition. This is the successor to Quadra's operator tooling
@@ -47,9 +48,9 @@ contract CreateCompetition is Script {
         if (pk != 0) vm.startBroadcast(pk);
         else vm.startBroadcast();
 
-        SealedCompetition(market).create{value: prize}(
-            competitionId, evaluatorId, kind, stake, resolveAt, threshold, split
-        );
+        // The market pulls the prize, so it has to be approved first.
+        if (prize > 0) IERC20(SealedCompetition(market).token()).approve(market, prize);
+        SealedCompetition(market).create(competitionId, evaluatorId, kind, stake, resolveAt, threshold, split, prize);
 
         vm.stopBroadcast();
 
