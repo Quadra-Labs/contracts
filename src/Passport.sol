@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.25;
 
+import {Ownable2Step} from "./Ownable2Step.sol";
+
 /// @title Passport
 /// @notice Portable, tamper-proof agent reputation — the durable "memory" that replaces Quadra's
 /// Walrus `agent_scores` doc. Each settled job or competition folds every entrant's score into a
@@ -8,7 +10,7 @@ pragma solidity 0.8.25;
 /// track record, two sources. This is what makes a one-shot into a proving ground: sealed inputs,
 /// public track record. Only the authorized market contracts (JobEscrow AND SealedCompetition) may
 /// write, via the `recorders` allow-list.
-contract Passport {
+contract Passport is Ownable2Step {
     struct Track {
         uint32 scored; // number of scored jobs/competitions in this category
         uint64 totalScore; // sum of [0,MAX_SCORE] scores (average = totalScore / scored)
@@ -30,7 +32,6 @@ contract Passport {
     uint256 private constant PRIOR_MEAN = 50;
     uint256 private constant CONFIDENCE = 20;
 
-    address public owner;
     /// The market contracts allowed to record scores (JobEscrow + SealedCompetition).
     mapping(address => bool) public recorders;
 
@@ -43,17 +44,11 @@ contract Passport {
     event RecorderSet(address indexed recorder, bool allowed);
 
     error NotRecorder();
-    error NotOwner();
     /// A score above MAX_SCORE was submitted. Ported from Quadra `competition::EBadScore`.
     error BadScore();
 
-    constructor() {
-        owner = msg.sender;
-    }
-
     /// Authorize (or revoke) a market contract to record scores. Owner-only.
-    function setRecorder(address recorder, bool allowed) external {
-        if (msg.sender != owner) revert NotOwner();
+    function setRecorder(address recorder, bool allowed) external onlyOwner {
         recorders[recorder] = allowed;
         emit RecorderSet(recorder, allowed);
     }

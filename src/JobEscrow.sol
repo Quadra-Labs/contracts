@@ -2,6 +2,8 @@
 pragma solidity 0.8.25;
 
 import {IFtsoFeedVerifier} from "./interfaces/IFtsoFeedVerifier.sol";
+import {Ownable2Step} from "./Ownable2Step.sol";
+import {SignatureLib} from "./SignatureLib.sol";
 import {FtsoLib} from "./FtsoLib.sol";
 
 interface ITeeRegistry {
@@ -39,7 +41,7 @@ interface IPassport {
 /// Units: Quadra measured its refund window in MILLISECONDS (`REFUND_WAIT_MS = 1_800_000`) because
 /// Sui's `Clock` is millisecond-resolution. `block.timestamp` is seconds, so every deadline here is
 /// a unix SECOND. Carrying a millisecond literal across would turn a 30-minute window into 500 hours.
-contract JobEscrow {
+contract JobEscrow is Ownable2Step {
     struct Job {
         address user;
         address agent;
@@ -57,7 +59,6 @@ contract JobEscrow {
     /// The FTSO anchor-feed verifier used to cross-check the signed ground truth. Zero = dev/skip.
     IFtsoFeedVerifier public immutable ftsoVerifier;
 
-    address public owner;
     address public treasury;
     /// The intake engine: the only address that may release a payment. It decides validity (via the
     /// TEE) off-chain; on-chain that decision is simply trusted, exactly as Quadra trusts IntakeCap.
@@ -107,7 +108,6 @@ contract JobEscrow {
     /// commitment and the score - so the result stays the user's alpha while its accuracy is public.
     event ReceiptPublished(bytes32 indexed jobId, bytes receipt);
 
-    error NotOwner();
     error NotIntake();
     error NotRefunder();
     error BadFee();
@@ -129,11 +129,6 @@ contract JobEscrow {
     error BadTeeSignature();
     error BadReceipt();
 
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
-
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrant();
         _lock = 2;
@@ -150,7 +145,6 @@ contract JobEscrow {
         address intake_
     ) {
         if (feeBps_ > BPS_DENOM) revert BadFee();
-        owner = msg.sender;
         teeRegistry = ITeeRegistry(teeRegistry_);
         passport = IPassport(passport_);
         ftsoVerifier = IFtsoFeedVerifier(ftsoVerifier_);
@@ -364,22 +358,9 @@ contract JobEscrow {
         bytes32 structHash =
             keccak256(abi.encode(JOB_SETTLEMENT_TYPEHASH, jobId, receiptHash, agent, score, groundTruthValue));
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-        return _recover(digest, signature);
+        return SignatureLib.recover(digest, signature);
     }
 
-    function _recover(bytes32 digest, bytes calldata sig) private pure returns (address) {
-        if (sig.length != 65) return address(0);
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-        assembly {
-            r := calldataload(sig.offset)
-            s := calldataload(add(sig.offset, 32))
-            v := byte(0, calldataload(add(sig.offset, 64)))
-        }
-        if (v < 27) v += 27;
-        return ecrecover(digest, v, r, s);
-    }
 
     function setFee(uint16 feeBps_, address treasury_) external onlyOwner {
         if (feeBps_ > BPS_DENOM) revert BadFee();

@@ -2,6 +2,8 @@
 pragma solidity 0.8.25;
 
 import {IFtsoFeedVerifier} from "./interfaces/IFtsoFeedVerifier.sol";
+import {Ownable2Step} from "./Ownable2Step.sol";
+import {SignatureLib} from "./SignatureLib.sol";
 import {FtsoLib} from "./FtsoLib.sol";
 
 interface ITeeRegistry {
@@ -31,7 +33,7 @@ interface IPassport {
 /// pure scoring market would need. That choice is load-bearing: the width is baked into the EIP-712
 /// Entry typehash, so widening it later would mean changing this contract, the TEE signer and the
 /// verify tool in one atomic release.
-contract SealedCompetition {
+contract SealedCompetition is Ownable2Step {
     struct Competition {
         string evaluatorId;
         bytes32 category; // keccak256(evaluatorId), the Passport key
@@ -79,7 +81,6 @@ contract SealedCompetition {
     /// The FTSO anchor-feed verifier used to cross-check the signed ground truth. Zero = dev/skip.
     IFtsoFeedVerifier public immutable ftsoVerifier;
 
-    address public owner;
     /// Who may open a competition. Quadra gated `create_competition` on a `CompetitionCap` object;
     /// Flare has no object capabilities, so the same authority is an address allow-list. The
     /// reference made creation permissionless, which let anyone open a competition under any id and
@@ -137,7 +138,6 @@ contract SealedCompetition {
     event PrizeClaimed(address indexed agent, uint256 amount);
     event RemainingWithdrawn(bytes32 indexed competitionId, address indexed to, uint256 amount);
 
-    error NotOwner();
     error NotOperator();
     error AlreadyExists();
     error NoCompetition();
@@ -163,11 +163,6 @@ contract SealedCompetition {
     error DuplicateEntry();
     error NothingOwed();
 
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
-
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrant();
         _lock = 2;
@@ -176,7 +171,6 @@ contract SealedCompetition {
     }
 
     constructor(address teeRegistry_, address passport_, address ftsoVerifier_) {
-        owner = msg.sender;
         operators[msg.sender] = true;
         teeRegistry = ITeeRegistry(teeRegistry_);
         passport = IPassport(passport_);
@@ -466,22 +460,9 @@ contract SealedCompetition {
             )
         );
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-        return _recover(digest, signature);
+        return SignatureLib.recover(digest, signature);
     }
 
-    function _recover(bytes32 digest, bytes calldata sig) private pure returns (address) {
-        if (sig.length != 65) return address(0);
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-        assembly {
-            r := calldataload(sig.offset)
-            s := calldataload(add(sig.offset, 32))
-            v := byte(0, calldataload(add(sig.offset, 64)))
-        }
-        if (v < 27) v += 27;
-        return ecrecover(digest, v, r, s);
-    }
 
     /// Non-empty and summing to exactly 100 (Quadra `valid_split`, PCT_DENOM = 100).
     function _validSplit(uint16[] calldata splitPct) internal pure returns (bool) {

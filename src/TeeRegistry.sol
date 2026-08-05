@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 pragma solidity 0.8.25;
 
+import {Ownable2Step} from "./Ownable2Step.sol";
 import {IVtpmAttestation} from "./interfaces/IVtpmAttestation.sol";
 
 /// @title TeeRegistry
@@ -25,9 +26,7 @@ import {IVtpmAttestation} from "./interfaces/IVtpmAttestation.sol";
 ///
 /// All paths converge on `activeTeeWallet`, so JobEscrow and SealedCompetition are unaware of which
 /// one bound it and need no rewiring to switch modes.
-contract TeeRegistry {
-    address public owner;
-
+contract TeeRegistry is Ownable2Step {
     /// The currently trusted TEE wallet (recovers EIP-712 settlement signatures against this).
     address public activeTeeWallet;
     /// The TEE's secp256k1 public key, so agents can ECIES-seal submissions to it.
@@ -39,18 +38,11 @@ contract TeeRegistry {
 
     event TeeRegistered(address indexed teeWallet, string imageDigest);
 
-    error NotOwner();
     error VtpmUnset();
     error BadImageDigest();
     error BadNonce();
 
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
-        _;
-    }
-
     constructor(string memory expectedImageDigest_, address vtpm_) {
-        owner = msg.sender;
         expectedImageDigest = expectedImageDigest_;
         vtpm = IVtpmAttestation(vtpm_);
     }
