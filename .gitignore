@@ -3,6 +3,12 @@ out/
 cache/
 broadcast/
 
+# Secrets. `forge script` auto-loads `.env` from the project root, so the deployer key lives here
+# and must never be committed. `.env.example` is the documented template and IS tracked.
+.env
+.env.*
+!.env.example
+
 # Tests are written, run green, and not committed - this repo carries source only.
 # They live outside the working tree between runs; see the migration notes.
 test/
