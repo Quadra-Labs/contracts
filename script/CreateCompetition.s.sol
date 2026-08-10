@@ -13,7 +13,8 @@ import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 ///
 /// Environment:
 ///   SEALED_COMPETITION  the market address (required).
-///   COMPETITION_LABEL   human label; the id is keccak(label). Default "demo-1".
+///   COMPETITION_LABEL   human label; the id is keccak256(abi.encode(operator, label)) — see below.
+///                       Default "demo-1".
 ///   EVALUATOR_ID        the scorer to use, e.g. "price-range-guess".
 ///   KIND                0 SCORING (default), 1 PERFORMANCE.
 ///   STAKE               what each agent posts to join, in wei. Default 0.
@@ -41,10 +42,20 @@ contract CreateCompetition is Script {
             split[i] = uint16(rawSplit[i]);
         }
 
-        bytes32 competitionId = keccak256(bytes(label));
+        uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
+
+        // The id is bound to the CREATOR, not the label alone. `create` reverts AlreadyExists and
+        // nothing is ever deleted, so a bare keccak(label) means the first operator to run this
+        // with "demo-1" burns that id permanently for everyone else. Operator-gating already keeps
+        // outsiders out; this is what keeps two of our own operators from colliding.
+        //
+        // `vm.addr(pk)`, NOT `msg.sender`: inside `run()` msg.sender is Foundry's DefaultSender,
+        // not the key that broadcasts below, so deriving from it would produce an id nobody could
+        // reproduce from the operator address that actually appears on chain as the creator.
+        address operator = pk != 0 ? vm.addr(pk) : msg.sender;
+        bytes32 competitionId = keccak256(abi.encode(operator, label));
         uint64 resolveAt = uint64(block.timestamp + resolveIn);
 
-        uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
         if (pk != 0) vm.startBroadcast(pk);
         else vm.startBroadcast();
 
@@ -55,6 +66,8 @@ contract CreateCompetition is Script {
         vm.stopBroadcast();
 
         console2.log("market      ", market);
+        console2.log("operator    ", operator);
+        console2.log("label       ", label);
         console2.log("evaluatorId ", evaluatorId);
         console2.log("kind        ", kind);
         console2.log("stake       ", stake);

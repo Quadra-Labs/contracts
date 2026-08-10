@@ -67,10 +67,17 @@ contract TeeRegistry is Ownable2Step {
     /// the production attestation pin, so once `register` is the real trust root this setter has to
     /// go (or the digest has to become write-once). Left as-is for now because the dev path is the
     /// only way to run the stack before attestation is stood up.
+    ///
+    /// Zero is rejected rather than treated as "revoke the TEE". Both settlement paths already
+    /// refuse a zero signer, so a zeroed slot only looks like a configured-but-broken registry; a
+    /// caller cannot tell it from a fresh deployment. To retire a compromised enclave, point this
+    /// at an owner-controlled BURNER address instead: settlement then fails signature recovery
+    /// exactly as intended, and `activeTeeWallet` still says on chain who is trusted right now.
     function setActiveTee(address teeWallet, bytes calldata teePublicKey, string calldata imageDigest)
         external
         onlyOwner
     {
+        if (teeWallet == address(0)) revert ZeroAddress();
         activeTeeWallet = teeWallet;
         activeTeePublicKey = teePublicKey;
         expectedImageDigest = imageDigest;
@@ -130,8 +137,15 @@ contract TeeRegistry is Ownable2Step {
         activeTeeWallet = teeMachine;
         activeTeePublicKey = teePublicKey;
         fccMode = true;
+        // `FccTeeRegistered` is the ONLY event this path emits, and it deliberately carries no
+        // image digest. `TeeRegistered(machine, expectedImageDigest)` used to follow it, which
+        // published an on-chain claim that this machine runs that image — while this function
+        // checks no code identity at all (see above), and `expectedImageDigest` is whatever some
+        // earlier `setActiveTee` left in storage (`sha256:dev` on the live deployment). An indexer
+        // reading `TeeRegistered` would have recorded that as the attested identity of a real
+        // Flare TEE machine. Under FCC the code identity lives in Flare's `allow-tee-version`
+        // whitelist, so the honest thing to publish here is the binding and nothing more.
         emit FccTeeRegistered(teeMachine, fccExtensionId);
-        emit TeeRegistered(teeMachine, expectedImageDigest);
     }
 
     /// The attestation nonce the enclave MUST request when fetching its token, binding the token to

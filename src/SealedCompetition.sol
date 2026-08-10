@@ -70,6 +70,12 @@ contract SealedCompetition is Ownable2Step {
     /// The off-chain ROI evaluator MUST use this same encoding.
     uint64 public constant PERF_BASE = 1_000_000;
 
+    /// The app's canonical price precision (1e-8 fixed point), re-exposed from `FtsoLib` so
+    /// off-chain code READS this rather than re-declaring 8 independently. FtsoLib's own comment
+    /// already promised this getter existed on both markets; it did not, and a silent disagreement
+    /// mis-scales every price by a power of ten with no compile signal on either side.
+    uint256 public constant PRICE_DECIMALS = FtsoLib.PRICE_DECIMALS;
+
     /// Winner shares are percentages and must sum to exactly this.
     uint16 private constant PCT_DENOM = 100;
 
@@ -301,6 +307,10 @@ contract SealedCompetition is Ownable2Step {
         Competition storage c = competitions[competitionId];
         if (!c.exists) revert NoCompetition();
         if (c.settled) revert AlreadySettled();
+        // Same guard order as settle/settleFromTee: the terminal flags are asserted before the
+        // timing window, so a second call names what actually happened instead of re-emitting
+        // `Cancelled(id, 0)` and leaving an audit trail showing one competition cancelled twice.
+        if (c.cancelled) revert AlreadyCancelled();
         if (block.timestamp < uint256(c.resolveAt) + CANCEL_WINDOW) revert TooEarly();
 
         c.cancelled = true;

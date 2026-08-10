@@ -66,9 +66,36 @@ contract EvaluationInstructionSender {
         teeMachineRegistry = _teeMachineRegistry;
     }
 
+    /// Bind the extension id directly. This is the normal path: `register-extension` prints the id
+    /// it allocated, and `DeployFcc.s.sol` already reads it from the environment and asserts the
+    /// binding before getting here.
+    ///
+    /// Constant gas — one staticcall — where the no-argument scan below costs one call per id in
+    /// Flare's entire public extension space. Still permissionless and still set-once: the registry
+    /// remains the source of truth and an id that does not resolve to this address reverts, so a
+    /// caller can supply the id but never influence the answer.
+    ///
+    /// It also removes an ambiguity the scan cannot: if this address were ever bound under two ids,
+    /// the scan silently takes the LOWEST, and nothing about that choice is visible afterwards.
+    function setExtensionId(uint256 id) external {
+        if (_extensionId != 0) revert ExtensionIdAlreadySet();
+        if (id < FIRST_PUBLIC_EXTENSION_ID) revert ExtensionIdNotFound();
+        if (teeExtensionRegistry.getTeeExtensionInstructionsSender(id) != address(this)) {
+            revert ExtensionIdNotFound();
+        }
+        _extensionId = id;
+        emit ExtensionIdSet(id);
+    }
+
     /// Find the extension id this contract was registered under. Permissionless and set-once: the
     /// registry is the source of truth, so there is nothing here for a caller to influence.
     /// Must be called AFTER `register-extension`, which is why it is not done in the constructor.
+    ///
+    /// Kept as the recovery path for when the allocated id was never recorded. Prefer the
+    /// single-argument form above: this scan is unbounded in Flare's public id space, and if that
+    /// space ever grows a few hundred entries past the floor it exceeds the block gas limit — at
+    /// which point the only way to bind FCC at all is redeploying this contract and re-running
+    /// `register-extension` against the new address.
     function setExtensionId() external {
         if (_extensionId != 0) revert ExtensionIdAlreadySet();
         uint256 next = teeExtensionRegistry.nextPublicExtensionId();

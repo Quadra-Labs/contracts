@@ -159,6 +159,19 @@
   },
   {
     "type": "function",
+    "name": "setExtensionId",
+    "inputs": [
+      {
+        "name": "id",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "teeExtensionRegistry",
     "inputs": [],
     "outputs": [

@@ -52,7 +52,12 @@ contract Passport is Ownable2Step {
     error BadScore();
 
     /// Authorize (or revoke) a market contract to record scores. Owner-only.
+    ///
+    /// Zero is rejected so the allow-list cannot accumulate an entry for an address that could
+    /// never call `record` anyway. Revocation is `setRecorder(marketAddress, false)` — the flag,
+    /// not the address, is what turns a recorder off.
     function setRecorder(address recorder, bool allowed) external onlyOwner {
+        if (recorder == address(0)) revert ZeroAddress();
         recorders[recorder] = allowed;
         emit RecorderSet(recorder, allowed);
     }

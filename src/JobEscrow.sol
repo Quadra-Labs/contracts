@@ -74,6 +74,12 @@ contract JobEscrow is Ownable2Step {
 
     uint16 private constant BPS_DENOM = 10000;
 
+    /// The app's canonical price precision (1e-8 fixed point), re-exposed from `FtsoLib` so
+    /// off-chain code READS this rather than re-declaring 8 independently. FtsoLib's own comment
+    /// already promised this getter existed on both markets; it did not, and a silent disagreement
+    /// mis-scales every price by a power of ten with no compile signal on either side.
+    uint256 public constant PRICE_DECIMALS = FtsoLib.PRICE_DECIMALS;
+
     mapping(bytes32 => Job) public jobs;
     mapping(bytes32 => bytes32) public deliveredHash; // jobId => keccak(ciphertext)
     mapping(bytes32 => bytes32) public scoredReceiptHash;
@@ -141,6 +147,10 @@ contract JobEscrow is Ownable2Step {
     error BadReceipt();
     error DeliveryRejected();
     error ActionIdConsumed();
+    /// `userPubKey` is not an uncompressed secp256k1 point, so no agent could ever seal to it.
+    error BadUserKey();
+    /// `evaluatorId` is empty, which would open a Passport track under `keccak256("")`.
+    error BadEvaluator();
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrant();
@@ -160,6 +170,7 @@ contract JobEscrow is Ownable2Step {
     ) {
         if (feeBps_ > BPS_DENOM) revert BadFee();
         if (token_ == address(0)) revert ZeroAddress();
+        if (feeBps_ > 0 && treasury_ == address(0)) revert ZeroAddress();
         token = IERC20(token_);
         teeRegistry = ITeeRegistry(teeRegistry_);
         passport = IPassport(passport_);
@@ -186,6 +197,13 @@ contract JobEscrow is Ownable2Step {
     ///
     /// The two deadlines are independent: an agent might deliver in seconds a forecast that is only
     /// judgeable an hour later, so `lifetimeEnd` may be far past `deliveryDeadline`.
+    ///
+    /// `userPubKey` is validated BEFORE the escrow is taken, mirroring Quadra `intake::pay_for_job`,
+    /// which failed the buyer on its first statement rather than after taking the coin. The
+    /// predicate byte-matches the agent's own `assertUsableUserKey` (`agent/app/src/seal.ts`): an
+    /// uncompressed secp256k1 point, 65 bytes starting `0x04`. That guard protects the AGENT's
+    /// stake; only the contract can protect the BUYER, who would otherwise fund a job that no agent
+    /// can ever deliver to and wait out `deliveryDeadline` for a refund.
     function payForJob(
         bytes32 jobId,
         address agent,
@@ -201,6 +219,8 @@ contract JobEscrow is Ownable2Step {
         if (cost == 0) revert NoEscrow();
         if (deliveryDeadline <= block.timestamp) revert BadDeadline();
         if (lifetimeEnd < deliveryDeadline) revert BadDeadline();
+        if (userPubKey.length != 65 || userPubKey[0] != 0x04) revert BadUserKey();
+        if (bytes(evaluatorId).length == 0) revert BadEvaluator();
         jobs[jobId] = Job({
             user: msg.sender,
             agent: agent,
@@ -378,12 +398,12 @@ contract JobEscrow is Ownable2Step {
         uint256 groundTruthValue,
         bytes calldata signature
     ) private view returns (address) {
-        bytes32 structHash =
-            keccak256(abi.encode(JOB_SETTLEMENT_TYPEHASH, jobId, receiptHash, agent, score, groundTruthValue));
+        bytes32 structHash = keccak256(
+            abi.encode(JOB_SETTLEMENT_TYPEHASH, jobId, receiptHash, agent, score, groundTruthValue)
+        );
         bytes32 digest = keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
         return SignatureLib.recover(digest, signature);
     }
-
 
     // --- Flare Confidential Compute settlement ---------------------------------------------------
     //
@@ -477,14 +497,27 @@ contract JobEscrow is Ownable2Step {
         consumedActionId[actionId] = true;
     }
 
+    /// Move the platform fee or its recipient.
+    ///
+    /// The zero-treasury guard is gated on the FEE rather than forbidding a zero address outright,
+    /// because `_release` only touches the treasury when the fee is non-zero — so zero fee plus
+    /// zero treasury is a legitimate fee-free configuration. With a fee set it is not: the payout
+    /// would reach `safeTransfer(address(0), fee)`, which the token rejects, and EVERY release
+    /// reverts until the owner notices. The buyer still gets a refund, but only for work the agent
+    /// actually did.
     function setFee(uint16 feeBps_, address treasury_) external onlyOwner {
         if (feeBps_ > BPS_DENOM) revert BadFee();
+        if (feeBps_ > 0 && treasury_ == address(0)) revert ZeroAddress();
         feeBps = feeBps_;
         treasury = treasury_;
         emit FeeChanged(feeBps_, treasury_);
     }
 
+    /// Point at a new intake engine. Zero is rejected rather than treated as "disable releases":
+    /// no caller can ever be `address(0)`, so the slot would silently brick `releasePayment` while
+    /// still reading as a configured role. Pausing is a different feature and should look like one.
     function setIntake(address intake_) external onlyOwner {
+        if (intake_ == address(0)) revert ZeroAddress();
         intake = intake_;
         emit IntakeChanged(intake_);
     }

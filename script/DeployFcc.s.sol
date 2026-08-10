@@ -65,8 +65,12 @@ contract DeployFcc is Script {
         else vm.startBroadcast();
 
         // Idempotent: a re-run after a partial failure must not revert on work already done.
+        //
+        // Passes the id explicitly rather than making the contract scan for it. We already know it
+        // (`EXTENSION_ID`) and asserted its binding above, so the scan would only re-derive what
+        // this script just proved — at one external call per id from the public floor upward.
         if (EvaluationInstructionSender(senderAddr).extensionIdOrZero() == 0) {
-            EvaluationInstructionSender(senderAddr).setExtensionId();
+            EvaluationInstructionSender(senderAddr).setExtensionId(extensionId);
         }
         registry.configureFcc(machineRegistry, extensionId);
         registry.registerFccTee(teeMachine, teePubKey);

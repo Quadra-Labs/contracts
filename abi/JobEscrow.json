@@ -42,6 +42,19 @@
   },
   {
     "type": "function",
+    "name": "PRICE_DECIMALS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "acceptOwnership",
     "inputs": [],
     "outputs": [],
@@ -883,6 +896,11 @@
   },
   {
     "type": "error",
+    "name": "BadEvaluator",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "BadFee",
     "inputs": []
   },
@@ -904,6 +922,11 @@
   {
     "type": "error",
     "name": "BadTeeSignature",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "BadUserKey",
     "inputs": []
   },
   {
