@@ -1,0 +1,21 @@
+# Line endings are load-bearing in this repo, so they are pinned rather than left to whatever the
+# cloning machine has configured.
+#
+# Git for Windows ships `core.autocrlf=true` in its system gitconfig, and nothing here overrode it.
+# Without the rules below, a fresh clone on Windows materialises the working tree with CRLF while
+# `forge` keeps emitting LF, which breaks two things at once:
+#
+#   - `script/abi.sh --check` compares forge's LF output against a CRLF working copy and reports
+#     all six artifacts as drifted on a tree nobody has touched;
+#   - `script/abi.sh` itself gets a CRLF shebang, and bash fails it with `$'\r': command not found`.
+#
+# Both read as real problems and are not. Normalising to LF everywhere costs nothing on Windows —
+# every editor in use here handles LF — and removes a whole class of false alarm.
+
+* text=auto eol=lf
+
+# Called as programs, so their line endings are a correctness matter, not a preference.
+*.sh text eol=lf
+
+# Compared byte for byte against `forge inspect` output by script/abi.sh.
+abi/*.json text eol=lf
