@@ -1,12 +1,12 @@
 {
   "chainId": 114,
-  "quadraToken": "0xeB4C1BfeB472711961bb14Ca4050582EFEe925d0",
-  "teeRegistry": "0xe7C993BaAE035B40da4b7FFcCAA4F7F6D70Bbce9",
-  "passport": "0x73372478b9f3673B263c08A5f239188c3BCCCC7a",
-  "jobEscrow": "0x355145f9d6020E98D94E6249C16fb0fabfa38641",
-  "sealedCompetition": "0xCA0078F011492B8B8aa7C73dCe03ba59045FFbc6",
+  "quadraToken": "0x64eDA650dE75504E8e540FdEb0edDD4E8D631Dd3",
+  "teeRegistry": "0x4CBfCcBF79d2C2F775cDAdB238942cf7D456b32F",
+  "passport": "0x16B95A95d1809fd5Ec81D946576FdF8C0DB7aB1e",
+  "jobEscrow": "0x351e9BF23e51A22aA35f5Fa71c5bF371Da2AA15F",
+  "sealedCompetition": "0xEbE6676650A565c528BD35eab56609C3100B8492",
   "evaluationInstructionSender": "",
-  "treasury": "0xE01dcfdfcB48D69bF5Bb017f2d8569c0005cB108",
-  "intake": "0xE01dcfdfcB48D69bF5Bb017f2d8569c0005cB108",
+  "treasury": "0x3C76Ea5F58a76eCf11443Efb1Cf292EC37914949",
+  "intake": "0x3C76Ea5F58a76eCf11443Efb1Cf292EC37914949",
   "ftsoVerifier": "0xC4e9c78EA53db782E28f28Fdf80BaF59336B304d"
 }
