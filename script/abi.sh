@@ -25,6 +25,7 @@ set -euo pipefail
 # Ownable2Step and the interfaces are deliberately absent: nothing downstream binds to them, and
 # an artifact nobody reads is one more thing to keep in step for no benefit.
 CONTRACTS=(
+    ConfidentialSpaceVerifier
     EvaluationInstructionSender
     JobEscrow
     Passport
@@ -99,7 +100,10 @@ drift=0
 # rather than by parsing out/ keeps this script dependency-free — contracts/ has no package.json
 # and no node_modules, and requiring a JSON parser here would be a new prerequisite for a repo
 # that currently needs only foundry.
-declared="$(grep -hoE '^contract [A-Za-z0-9_]+' src/*.sol | awk '{print $2}' | sort -u)"
+# `src/*/*.sol` as well as `src/*.sol`: the vTPM verifier lives in src/vtpm/, and a coverage check
+# that only sees the top level would report "in step" while a whole deployable contract had no
+# artifact — the precise failure this section exists to catch.
+declared="$(grep -hoE '^contract [A-Za-z0-9_]+' src/*.sol src/*/*.sol | awk '{print $2}' | sort -u)"
 expected="$(printf '%s\n' "${CONTRACTS[@]}" | sort -u)"
 if [[ "$declared" != "$expected" ]]; then
     echo "COVERAGE the CONTRACTS list in this script does not match the concrete contracts in src/" >&2

@@ -250,6 +250,19 @@
   },
   {
     "type": "function",
+    "name": "setExpectedImageDigest",
+    "inputs": [
+      {
+        "name": "imageDigest",
+        "type": "string",
+        "internalType": "string"
+      }
+    ],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "teeMachineRegistry",
     "inputs": [],
     "outputs": [
@@ -286,6 +299,19 @@
       }
     ],
     "stateMutability": "view"
+  },
+  {
+    "type": "event",
+    "name": "ExpectedImageDigestChanged",
+    "inputs": [
+      {
+        "name": "imageDigest",
+        "type": "string",
+        "indexed": false,
+        "internalType": "string"
+      }
+    ],
+    "anonymous": false
   },
   {
     "type": "event",
@@ -390,6 +416,11 @@
   {
     "type": "error",
     "name": "BadNonce",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "EmptyImageDigest",
     "inputs": []
   },
   {
