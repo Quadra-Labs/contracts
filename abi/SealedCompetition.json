@@ -89,6 +89,19 @@
   },
   {
     "type": "function",
+    "name": "MAX_PARAMS_BYTES",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "MAX_PROOFS",
     "inputs": [],
     "outputs": [
@@ -241,6 +254,16 @@
         "name": "creator",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "lifetimeSecs",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "params",
+        "type": "bytes",
+        "internalType": "bytes"
       }
     ],
     "stateMutability": "view"
@@ -307,6 +330,16 @@
         "name": "prize",
         "type": "uint256",
         "internalType": "uint256"
+      },
+      {
+        "name": "lifetimeSecs",
+        "type": "uint32",
+        "internalType": "uint32"
+      },
+      {
+        "name": "params",
+        "type": "bytes",
+        "internalType": "bytes"
       }
     ],
     "outputs": [],
@@ -878,6 +911,18 @@
         "type": "address",
         "indexed": true,
         "internalType": "address"
+      },
+      {
+        "name": "lifetimeSecs",
+        "type": "uint32",
+        "indexed": false,
+        "internalType": "uint32"
+      },
+      {
+        "name": "params",
+        "type": "bytes",
+        "indexed": false,
+        "internalType": "bytes"
       }
     ],
     "anonymous": false
@@ -1181,6 +1226,11 @@
   },
   {
     "type": "error",
+    "name": "BadLifetime",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "BadReceipt",
     "inputs": []
   },
@@ -1268,6 +1318,11 @@
   },
   {
     "type": "error",
+    "name": "NoSubmission",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "NotCancelled",
     "inputs": []
   },
@@ -1314,6 +1369,11 @@
   {
     "type": "error",
     "name": "NothingStaked",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "ParamsTooLong",
     "inputs": []
   },
   {

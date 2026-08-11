@@ -53,7 +53,22 @@ contract SealedCompetition is Ownable2Step {
         bool settled;
         bool cancelled;
         address creator;
+        /// The window the entries are SCORED over, ending at `resolveAt`. See `create`.
+        ///
+        /// Declared here rather than beside `resolveAt` for two reasons: it packs into `creator`'s
+        /// slot for free, and appending it leaves every index in the auto-generated `competitions`
+        /// getter unchanged — three repos read that tuple positionally, and a shifted index is the
+        /// kind of break that decodes cleanly into the wrong field.
+        uint32 lifetimeSecs;
         uint16[] splitPct; // winner split, sums to 100; length = number of winner slots
+        /// What this competition is ABOUT, in `JobEscrow`'s `params` convention (JSON-in-hex).
+        ///
+        /// A competition used to record only an `evaluatorId`, so the enclave had nothing to
+        /// resolve an asset from and fell back to its own `DEFAULT_FEED` — an ETH competition was
+        /// graded against the BTC anchor feed, and the operator could change what every competition
+        /// was measured by without changing the code hash. Carrying the same blob a paid job
+        /// carries means `quadra-core`'s `jobAsset()` reads both with one implementation.
+        bytes params;
     }
 
     /// One agent's ranking value, as signed by the TEE at settlement.
@@ -112,6 +127,14 @@ contract SealedCompetition is Ownable2Step {
     /// tail rather than blocking settlement — a hostile entrant naming a hundred assets must not
     /// be able to stop everyone else being paid.
     uint256 public constant MAX_PROOFS = 10;
+
+    /// Cap on the `params` blob a competition may carry.
+    ///
+    /// It is stored, not merely emitted, so an unbounded blob is unbounded storage paid for once by
+    /// an operator and read forever by everyone else. 512 bytes is two orders of magnitude past
+    /// `{"asset":"ETH"}` and past anything `decodeJobParams` is designed to parse — a bound on
+    /// abuse rather than a bound on working, the same discipline as the attestation payload bound.
+    uint256 public constant MAX_PARAMS_BYTES = 512;
 
     /// QUADRA. Stakes and prizes are denominated in it; gas is still native C2FLR.
     IERC20 public immutable token;
@@ -180,7 +203,9 @@ contract SealedCompetition is Ownable2Step {
         uint256 seedPrize,
         uint64 resolveAt,
         uint64 threshold,
-        address indexed creator
+        address indexed creator,
+        uint32 lifetimeSecs,
+        bytes params
     );
     event Joined(bytes32 indexed competitionId, address indexed agent, uint256 stake);
     event Submitted(bytes32 indexed competitionId, address indexed agent, bytes32 ciphertextHash);
@@ -217,7 +242,10 @@ contract SealedCompetition is Ownable2Step {
     error TeeRevoked();
     error BadReceipt();
     error EntryNotJoined();
+    error NoSubmission();
     error DuplicateEntry();
+    error BadLifetime();
+    error ParamsTooLong();
     error NothingOwed();
     error ActionIdConsumed();
     error TooManySlots();
@@ -274,6 +302,19 @@ contract SealedCompetition is Ownable2Step {
     /// `exists` is an explicit flag rather than a `resolveAt != 0` sentinel. With the sentinel, a
     /// competition created with `resolveAt = 0` absorbed its funding and then read as nonexistent
     /// everywhere, so it could be created again by anyone while its money stayed locked.
+    ///
+    /// `lifetimeSecs` and `params` are what make a competition SELF-DESCRIBING, and they exist
+    /// because it was not. The enclave scores entries over a window ending at `resolveAt` and
+    /// against one price feed; with neither recorded on chain it took both from its own
+    /// configuration — `DEFAULT_LIFETIME_SECS` and `DEFAULT_FEED` — so a competition about ETH
+    /// resolving in six hours was graded on the BTC feed over its last hour, and no agent could
+    /// read the window it was actually being judged over. Both are now the competition's own
+    /// property, fixed when it is created and visible to everyone who has to agree about it.
+    ///
+    /// `params` follows `JobEscrow`'s convention exactly (JSON-in-hex, e.g. `{"asset":"ETH"}`), so
+    /// `quadra-core`'s `jobAsset()` reads a job and a competition with one implementation. An empty
+    /// blob is legal and means "no asset declared": the enclave then falls back to its default feed
+    /// and says so, which is the old behaviour kept reachable rather than the old behaviour kept.
     function create(
         bytes32 competitionId,
         string calldata evaluatorId,
@@ -282,7 +323,9 @@ contract SealedCompetition is Ownable2Step {
         uint64 resolveAt,
         uint64 threshold,
         uint16[] calldata splitPct,
-        uint256 prize
+        uint256 prize,
+        uint32 lifetimeSecs,
+        bytes calldata params
     ) external {
         if (!operators[msg.sender]) revert NotOperator();
         if (competitions[competitionId].exists) revert AlreadyExists();
@@ -293,6 +336,13 @@ contract SealedCompetition is Ownable2Step {
         // funding would be stranded: join reverts NotOpen, and the money only leaves through
         // settlement or cancellation.
         if (resolveAt <= block.timestamp) revert BadResolveAt();
+        // Zero is rejected rather than read as "use the engine's default". A default is exactly
+        // what this field replaces, and accepting zero would leave the ambiguity in place while
+        // looking like it had been removed. There is deliberately no upper bound: a window longer
+        // than the competition has existed simply reaches back before it was created, which is a
+        // legitimate thing to score (the price history is public either way).
+        if (lifetimeSecs == 0) revert BadLifetime();
+        if (params.length > MAX_PARAMS_BYTES) revert ParamsTooLong();
 
         Competition storage c = competitions[competitionId];
         c.evaluatorId = evaluatorId;
@@ -305,10 +355,31 @@ contract SealedCompetition is Ownable2Step {
         c.threshold = threshold;
         c.exists = true;
         c.creator = msg.sender;
+        c.lifetimeSecs = lifetimeSecs;
         c.splitPct = splitPct; // calldata -> storage copy
+        c.params = params;
 
         if (prize > 0) token.safeTransferFrom(msg.sender, address(this), prize);
-        emit CompetitionCreated(competitionId, evaluatorId, kind, stake, prize, resolveAt, threshold, msg.sender);
+        _emitCreated(competitionId, evaluatorId, kind, stake, prize, resolveAt, threshold, lifetimeSecs, params);
+    }
+
+    /// `CompetitionCreated` carries ten fields, which overflows the stack if emitted inline beside
+    /// the struct write above. Isolating it keeps `create` within the stack limit — the same shape
+    /// `JobEscrow._emitJobPaid` uses, and for the same reason.
+    function _emitCreated(
+        bytes32 competitionId,
+        string calldata evaluatorId,
+        uint8 kind,
+        uint256 stake,
+        uint256 prize,
+        uint64 resolveAt,
+        uint64 threshold,
+        uint32 lifetimeSecs,
+        bytes calldata params
+    ) private {
+        emit CompetitionCreated(
+            competitionId, evaluatorId, kind, stake, prize, resolveAt, threshold, msg.sender, lifetimeSecs, params
+        );
     }
 
     function join(bytes32 competitionId) external {
@@ -549,6 +620,15 @@ contract SealedCompetition is Ownable2Step {
         for (uint256 i = 0; i < entries.length; i++) {
             address agent = entries[i].agent;
             if (!joined[competitionId][agent]) revert EntryNotJoined();
+            // Every scored entry must point at a ciphertext this contract actually witnessed.
+            //
+            // `joined` alone proves the agent paid a stake, not that it ever submitted anything —
+            // so a compromised or buggy enclave could score a joiner who never played, and the
+            // Passport write would be indistinguishable from a real one. The commitment is the
+            // only thing here that the agent itself put on chain, which is what makes it worth
+            // checking: the engine already builds its entry set from `Submitted` logs, so this
+            // rejects nothing an honest settlement produces.
+            if (submissions[competitionId][agent] == bytes32(0)) revert NoSubmission();
             if (recorded[competitionId][agent]) revert DuplicateEntry();
             recorded[competitionId][agent] = true;
 
