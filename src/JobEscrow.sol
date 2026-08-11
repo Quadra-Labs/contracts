@@ -271,6 +271,14 @@ contract JobEscrow is Ownable2Step {
     /// stored; the ciphertext is in calldata for the user + TEE to read from the tx. The user can
     /// decrypt and read their private result immediately. Re-delivery is allowed until the escrow is
     /// released — a rejected delivery can be corrected while there is still time.
+    ///
+    /// CALL THIS DIRECTLY. Because the bytes live only in calldata, the buyer and the evaluation
+    /// engine both recover them by decoding THIS function's arguments out of the transaction that
+    /// carried them. A delivery routed through a multicall, a relayer contract or an
+    /// account-abstraction bundle still records a valid `deliveredHash` and still emits `Delivered`,
+    /// and the bytes are then unrecoverable by anyone: the engine scores the job ZERO on an empty
+    /// submission and the agent's `Passport` carries it permanently. The contract cannot detect this
+    /// — every path here is legal — so it is stated rather than enforced. See BUGS.md 29.
     function deliver(bytes32 jobId, bytes calldata ciphertext) external {
         Job storage j = jobs[jobId];
         if (j.user == address(0)) revert NoJob();

@@ -330,6 +330,13 @@ contract SealedCompetition is Ownable2Step {
     /// The prediction stays PRIVATE: only its keccak commitment is stored; the ciphertext is in
     /// calldata for the TEE to read from the tx, decryptable only by the TEE's ECIES key.
     /// Overwritable while the competition is open, so a revised forecast replaces the old one.
+    ///
+    /// CALL THIS DIRECTLY. The TEE recovers the bytes by decoding THIS function's arguments out of
+    /// the transaction, so a submission routed through a multicall, a relayer contract or an
+    /// account-abstraction bundle emits a `Submitted` event whose ciphertext nobody can read. The
+    /// entry is then omitted from the settlement entirely — the stake is spent, no score is
+    /// recorded, and the competition resolves without it. The contract cannot detect this; see
+    /// `JobEscrow.deliver`, which carries the same requirement, and BUGS.md 29.
     function submitSealed(bytes32 competitionId, bytes calldata ciphertext) external {
         Competition storage c = competitions[competitionId];
         if (!c.exists) revert NoCompetition();
