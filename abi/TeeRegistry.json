@@ -227,6 +227,13 @@
   },
   {
     "type": "function",
+    "name": "revokeTee",
+    "inputs": [],
+    "outputs": [],
+    "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
     "name": "setActiveTee",
     "inputs": [
       {
@@ -409,6 +416,19 @@
     "anonymous": false
   },
   {
+    "type": "event",
+    "name": "TeeRevoked",
+    "inputs": [
+      {
+        "name": "previousWallet",
+        "type": "address",
+        "indexed": true,
+        "internalType": "address"
+      }
+    ],
+    "anonymous": false
+  },
+  {
     "type": "error",
     "name": "BadImageDigest",
     "inputs": []
@@ -431,6 +451,11 @@
   {
     "type": "error",
     "name": "NoTeeAvailable",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NoTeeBound",
     "inputs": []
   },
   {

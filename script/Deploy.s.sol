@@ -10,6 +10,7 @@ import {JobEscrow} from "../src/JobEscrow.sol";
 import {SealedCompetition} from "../src/SealedCompetition.sol";
 import {QuadraToken} from "../src/QuadraToken.sol";
 import {ConfidentialSpaceVerifier} from "../src/vtpm/ConfidentialSpaceVerifier.sol";
+import {IFlareSystemsManager} from "../src/interfaces/IFlareSystemsManager.sol";
 import {IFlareContractRegistry} from "../src/interfaces/IFlareContractRegistry.sol";
 
 /// @title Deploy
@@ -39,6 +40,8 @@ contract Deploy is Script {
     error MissingTreasury();
     error MissingIntake();
     error MissingFtsoVerifier();
+    /// The FTSO voting-round geometry could not be resolved and DEV is not set.
+    error MissingVotingEpoch();
     error RecordersNotWired();
 
     function run() external {
@@ -74,6 +77,18 @@ contract Deploy is Script {
         address ftsoVerifier = _resolveFtsoVerifier();
         if (ftsoVerifier == address(0) && !dev) revert MissingFtsoVerifier();
 
+        (uint64 firstVotingRoundStartTs, uint64 votingEpochSecs) = _resolveVotingEpoch();
+        if (votingEpochSecs == 0) {
+            // Refusing rather than defaulting. A hardcoded fallback is the exact failure this is
+            // resolved from chain to avoid, and on a real network guessing it means every
+            // settlement is judged against a round the engine did not use.
+            if (!dev) revert MissingVotingEpoch();
+            // Coston2's confirmed geometry, for anvil and fork runs only. Mirrors
+            // `quadra-core/feeds.ts`'s documented fallback, and is why that file labels it one.
+            firstVotingRoundStartTs = 1_658_430_000;
+            votingEpochSecs = 90;
+        }
+
         uint256 pk = vm.envOr("PRIVATE_KEY", uint256(0));
         if (pk != 0) vm.startBroadcast(pk);
         else vm.startBroadcast();
@@ -97,9 +112,26 @@ contract Deploy is Script {
         TeeRegistry registry = new TeeRegistry(digest, vtpmVerifier);
         Passport passport = new Passport();
         JobEscrow jobEscrow =
-            new JobEscrow(tokenAddr, address(registry), address(passport), treasury, feeBps, ftsoVerifier, intake);
+            new JobEscrow(
+            tokenAddr,
+            address(registry),
+            address(passport),
+            treasury,
+            feeBps,
+            ftsoVerifier,
+            intake,
+            firstVotingRoundStartTs,
+            votingEpochSecs
+        );
         SealedCompetition competition =
-            new SealedCompetition(tokenAddr, address(registry), address(passport), ftsoVerifier);
+            new SealedCompetition(
+            tokenAddr,
+            address(registry),
+            address(passport),
+            ftsoVerifier,
+            firstVotingRoundStartTs,
+            votingEpochSecs
+        );
 
         passport.setRecorder(address(jobEscrow), true);
         passport.setRecorder(address(competition), true);
@@ -152,6 +184,36 @@ contract Deploy is Script {
         if (override_ != address(0)) return override_;
         if (FLARE_CONTRACT_REGISTRY.code.length == 0) return address(0);
         return IFlareContractRegistry(FLARE_CONTRACT_REGISTRY).getContractAddressByName("FtsoV2");
+    }
+
+    /// The FTSO voting-round geometry both markets need to bind a proof to a settlement's instant.
+    ///
+    /// Resolved from `FlareSystemsManager` through the registry, exactly like the verifier above,
+    /// with env overrides for a fork or an anvil run. Returning zeros is only legal on the DEV
+    /// path — `run()` refuses them otherwise, because a deployment that guessed this geometry
+    /// accepts proofs from the wrong instant and reports nothing (see IFlareSystemsManager).
+    function _resolveVotingEpoch() internal view returns (uint64 firstStart, uint64 epochSecs) {
+        firstStart = uint64(vm.envOr("FIRST_VOTING_ROUND_START_TS", uint256(0)));
+        epochSecs = uint64(vm.envOr("VOTING_EPOCH_SECONDS", uint256(0)));
+        if (firstStart != 0 && epochSecs != 0) return (firstStart, epochSecs);
+
+        if (FLARE_CONTRACT_REGISTRY.code.length == 0) return (0, 0);
+        address manager =
+            IFlareContractRegistry(FLARE_CONTRACT_REGISTRY).getContractAddressByName("FlareSystemsManager");
+        if (manager == address(0)) return (0, 0);
+
+        // `try` rather than a bare call: an older manager that does not expose these leaves the
+        // deploy able to say WHICH read failed, instead of reverting inside a getter.
+        try IFlareSystemsManager(manager).firstVotingRoundStartTs() returns (uint64 s) {
+            firstStart = s;
+        } catch {
+            return (0, 0);
+        }
+        try IFlareSystemsManager(manager).votingEpochDurationSeconds() returns (uint64 d) {
+            epochSecs = d;
+        } catch {
+            return (0, 0);
+        }
     }
 
     /// One file per chain, read by every other repo so no address is ever hardcoded downstream.

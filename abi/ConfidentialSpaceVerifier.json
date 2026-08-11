@@ -40,6 +40,32 @@
   },
   {
     "type": "function",
+    "name": "MAX_HEADER_BYTES",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_PAYLOAD_BYTES",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "SW_NAME",
     "inputs": [],
     "outputs": [
@@ -386,6 +412,22 @@
     "type": "error",
     "name": "NotPendingOwner",
     "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "PartTooLong",
+    "inputs": [
+      {
+        "name": "got",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "max",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
   },
   {
     "type": "error",

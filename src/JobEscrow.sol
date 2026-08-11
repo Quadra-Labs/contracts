@@ -66,6 +66,12 @@ contract JobEscrow is Ownable2Step {
     /// The FTSO anchor-feed verifier used to cross-check the signed ground truth. Zero = dev/skip.
     IFtsoFeedVerifier public immutable ftsoVerifier;
 
+    /// FTSO epoch geometry, so the contract can derive WHICH voting round covers a job's
+    /// `lifetimeEnd` and refuse a proof from a different time. Resolved from `FlareSystemsManager`
+    /// at deploy and injected — never hardcoded. See `FtsoLib.GroundTruthWindow`.
+    uint64 public immutable firstVotingRoundStartTs;
+    uint64 public immutable votingEpochDurationSeconds;
+
     address public treasury;
     /// The intake engine: the only address that may release a payment. It decides validity (via the
     /// TEE) off-chain; on-chain that decision is simply trusted, exactly as Quadra trusts IntakeCap.
@@ -144,6 +150,9 @@ contract JobEscrow is Ownable2Step {
     error AlreadyScored();
     error NotReleased();
     error BadTeeSignature();
+    /// The registry has no TEE bound — deliberately revoked, or never wired. Distinct from
+    /// `BadTeeSignature` so a paused system is legible and a relayer can stop retrying.
+    error TeeRevoked();
     error BadReceipt();
     error DeliveryRejected();
     error ActionIdConsumed();
@@ -166,15 +175,22 @@ contract JobEscrow is Ownable2Step {
         address treasury_,
         uint16 feeBps_,
         address ftsoVerifier_,
-        address intake_
+        address intake_,
+        uint64 firstVotingRoundStartTs_,
+        uint64 votingEpochDurationSeconds_
     ) {
         if (feeBps_ > BPS_DENOM) revert BadFee();
         if (token_ == address(0)) revert ZeroAddress();
         if (feeBps_ > 0 && treasury_ == address(0)) revert ZeroAddress();
+        // Zero divides by zero in every round calculation, and is only reachable by deploying
+        // without resolving the geometry — caught here rather than at the first settlement.
+        if (votingEpochDurationSeconds_ == 0) revert FtsoLib.BadVotingEpoch();
         token = IERC20(token_);
         teeRegistry = ITeeRegistry(teeRegistry_);
         passport = IPassport(passport_);
         ftsoVerifier = IFtsoFeedVerifier(ftsoVerifier_);
+        firstVotingRoundStartTs = firstVotingRoundStartTs_;
+        votingEpochDurationSeconds = votingEpochDurationSeconds_;
         treasury = treasury_;
         feeBps = feeBps_;
         intake = intake_;
@@ -372,10 +388,14 @@ contract JobEscrow is Ownable2Step {
         if (keccak256(receipt) != receiptHash) revert BadReceipt();
 
         {
+            // Registry state BEFORE signature state, matching the guard order everywhere else in
+            // this file: the terminal condition is asserted first, so a revoked registry says so
+            // instead of being reported as a bad signature.
+            address tee = _activeTee();
             address signer = _recoverJobSettlement(jobId, receiptHash, j.agent, score, groundTruthValue, signature);
-            if (signer == address(0) || signer != teeRegistry.activeTeeWallet()) revert BadTeeSignature();
+            if (signer == address(0) || signer != tee) revert BadTeeSignature();
         }
-        FtsoLib.checkGroundTruth(ftsoVerifier, groundTruthValue, proof);
+        _checkGroundTruth(jobId, groundTruthValue, proof);
 
         _finishScore(jobId, score, receiptHash, receipt);
     }
@@ -469,7 +489,7 @@ contract JobEscrow is Ownable2Step {
         if (!j.released) revert NotReleased();
         if (block.timestamp < j.lifetimeEnd) revert TooEarly();
         if (keccak256(s.receipt) != s.receiptHash) revert BadReceipt();
-        FtsoLib.checkGroundTruth(ftsoVerifier, s.groundTruthValue, s.proof);
+        _checkGroundTruth(s.jobId, s.groundTruthValue, s.proof);
 
         j.scored = true;
         scoredReceiptHash[s.jobId] = s.receiptHash;
@@ -491,10 +511,46 @@ contract JobEscrow is Ownable2Step {
         uint8 status,
         bytes calldata signature
     ) private {
+        address tee = _activeTee();
         address signer = TeeActionResult.recoverSigner(resultData, actionId, submissionTag, status, signature);
-        if (signer == address(0) || signer != teeRegistry.activeTeeWallet()) revert BadTeeSignature();
+        if (signer == address(0) || signer != tee) revert BadTeeSignature();
         if (consumedActionId[actionId]) revert ActionIdConsumed();
         consumedActionId[actionId] = true;
+    }
+
+    /// The oracle cross-check, bound to the job's OWN lifetime end.
+    ///
+    /// `lifetimeEnd` is read from STORAGE, never from the settlement payload — it is what the buyer
+    /// fixed when they paid, so neither the enclave nor the relayer chooses which instant the proof
+    /// is judged against. Without the round bound a paid job scored at lifetime end could settle on
+    /// a genuine reading from years earlier, exactly as a competition could (BUGS.md 39).
+    function _checkGroundTruth(
+        bytes32 jobId,
+        uint256 groundTruthValue,
+        IFtsoFeedVerifier.FeedDataWithProof memory proof
+    ) private view {
+        FtsoLib.checkGroundTruth(
+            FtsoLib.GroundTruthWindow({
+                verifier: ftsoVerifier,
+                firstVotingRoundStartTs: firstVotingRoundStartTs,
+                votingEpochDurationSeconds: votingEpochDurationSeconds,
+                settlementTimeSecs: jobs[jobId].lifetimeEnd
+            }),
+            groundTruthValue,
+            proof
+        );
+    }
+
+    /// The registered TEE wallet, refusing a revoked (or never-wired) registry by name.
+    ///
+    /// Without this a zero `activeTeeWallet` reached the `signer != tee` comparison and produced
+    /// `BadTeeSignature` — the same error a genuinely bad signature gives — so "the operator
+    /// paused settlement" and "this relayer built a bad payload" were indistinguishable from
+    /// outside. One is terminal and one is worth retrying, which is precisely the distinction a
+    /// keeper needs to make.
+    function _activeTee() private view returns (address tee) {
+        tee = teeRegistry.activeTeeWallet();
+        if (tee == address(0)) revert TeeRevoked();
     }
 
     /// Move the platform fee or its recipient.

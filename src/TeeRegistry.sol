@@ -46,6 +46,7 @@ contract TeeRegistry is Ownable2Step {
     bool public fccMode;
 
     event TeeRegistered(address indexed teeWallet, string imageDigest);
+    event TeeRevoked(address indexed previousWallet);
     event FccTeeRegistered(address indexed teeMachine, uint256 extensionId);
     event FccConfigured(address indexed teeMachineRegistry, uint256 extensionId);
     event ExpectedImageDigestChanged(string imageDigest);
@@ -56,6 +57,9 @@ contract TeeRegistry is Ownable2Step {
     error FccUnset();
     error NoTeeAvailable();
     error EmptyImageDigest();
+    /// `revokeTee` was called with nothing bound. Distinguishes "already revoked" from a fresh
+    /// registry, which is exactly the distinction the revoke path exists to make legible.
+    error NoTeeBound();
 
     constructor(string memory expectedImageDigest_, address vtpm_) {
         expectedImageDigest = expectedImageDigest_;
@@ -70,11 +74,14 @@ contract TeeRegistry is Ownable2Step {
     /// go (or the digest has to become write-once). Left as-is for now because the dev path is the
     /// only way to run the stack before attestation is stood up.
     ///
-    /// Zero is rejected rather than treated as "revoke the TEE". Both settlement paths already
-    /// refuse a zero signer, so a zeroed slot only looks like a configured-but-broken registry; a
-    /// caller cannot tell it from a fresh deployment. To retire a compromised enclave, point this
-    /// at an owner-controlled BURNER address instead: settlement then fails signature recovery
-    /// exactly as intended, and `activeTeeWallet` still says on chain who is trusted right now.
+    /// Zero is rejected here rather than overloaded to mean "revoke": re-arming the registry and
+    /// disarming it are different intentions and now have different functions. To retire a
+    /// compromised enclave call `revokeTee`, which zeroes the slot AND emits `TeeRevoked`, so the
+    /// paused state is legible on chain instead of looking like a registry nobody ever wired.
+    ///
+    /// (This previously advised pointing the slot at an owner-controlled BURNER address, because a
+    /// zeroed slot was indistinguishable from a fresh deployment. `revokeTee` plus the
+    /// settlement-side `TeeRevoked` error removes the ambiguity that workaround existed to dodge.)
     function setActiveTee(address teeWallet, bytes calldata teePublicKey, string calldata imageDigest)
         external
         onlyOwner
@@ -105,6 +112,43 @@ contract TeeRegistry is Ownable2Step {
         activeTeeWallet = teeWallet;
         activeTeePublicKey = teePublicKey;
         emit TeeRegistered(teeWallet, imageDigest);
+    }
+
+    /// Retire the currently bound TEE. Settlement stops immediately, with a distinguishable error.
+    ///
+    /// THE HOLE THIS CLOSES. `register` overwrites `activeTeeWallet` unconditionally and
+    /// `setExpectedImageDigest` deliberately does not clear it, so before this existed the only
+    /// lever against a compromised enclave was pointing `setActiveTee` at a burner address. That
+    /// works, but it is indistinguishable on chain from a misconfiguration: settlements fail
+    /// signature recovery with `BadTeeSignature`, which is the same error an ordinary bad
+    /// signature produces, so an operator (or a relayer's retry logic) cannot tell "deliberately
+    /// paused" from "transiently broken" and retries into a wall.
+    ///
+    /// After this, both markets read a zero `activeTeeWallet` and revert `TeeRevoked` instead —
+    /// which a relayer can classify as TERMINAL and stop re-arming.
+    ///
+    /// WHAT THIS DOES NOT DO, stated plainly because it is the part that matters:
+    ///
+    ///  - It does not invalidate a signature an attacker already holds and has not yet submitted.
+    ///    Settlements are verified against `activeTeeWallet` AT THE TIME THE TRANSACTION LANDS, so
+    ///    revoking closes the window going forward; it cannot close it backwards. Revoke first,
+    ///    investigate second.
+    ///  - It does not stop a compromised IMAGE from re-binding. `register` is permissionless by
+    ///    design, so any VM running the pinned digest can bind a fresh key the moment this returns.
+    ///    Retiring a compromised image is TWO calls: `revokeTee()` then
+    ///    `setExpectedImageDigest(<new digest>)`. Doing only the first is a revocation that undoes
+    ///    itself.
+    ///  - It does not touch `expectedImageDigest`, on purpose. Clearing the pin would make
+    ///    `register` fail against every digest including the good one, turning a revocation into an
+    ///    outage that needs a second owner call to leave.
+    function revokeTee() external onlyOwner {
+        address previous = activeTeeWallet;
+        if (previous == address(0)) revert NoTeeBound();
+        activeTeeWallet = address(0);
+        activeTeePublicKey = "";
+        // `fccMode` is left as it was: it records HOW the retired key was bound, which is history
+        // worth keeping, and the next `register`/`registerFccTee` sets it correctly anyway.
+        emit TeeRevoked(previous);
     }
 
     /// Move the pinned code identity to a new image digest.

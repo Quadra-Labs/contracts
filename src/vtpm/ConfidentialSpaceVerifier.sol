@@ -70,6 +70,26 @@ contract ConfidentialSpaceVerifier is Ownable2Step, IVtpmAttestation {
     /// Clock skew allowed on `iat`, for a token minted moments before the block that carries it.
     uint256 public constant IAT_SKEW = 5 minutes;
 
+    /// Hard bounds on the JWT parts this will scan.
+    ///
+    /// `JwtJson.indexOf` / `indexOfLast` are naive substring scans and this contract runs seven of
+    /// them over the payload, so the gas cost is O(payload x claims). A real Confidential Space
+    /// payload is around 4 KB and verifying one costs ~2.35M gas — comfortably inside Coston2's
+    /// block limit, and a ONE-OFF cost per enclave registration rather than a per-settlement one,
+    /// which is why the scans are left as they are.
+    ///
+    /// What was unbounded is the INPUT. `register` is permissionless by design (the token is the
+    /// credential, not `msg.sender`), so without a cap any caller can hand this an arbitrarily
+    /// long `payload` and make it scan megabytes. That is self-limiting — they burn their own gas
+    /// — but it is a needless way to spend a block, and a bound is one comparison.
+    ///
+    /// 8 KB is double the observed payload, so Google can grow the token materially before this
+    /// needs revisiting. If it ever does, raise this AND hunt the claims in one pass instead of
+    /// seven; raising it alone moves the gas cost linearly.
+    uint256 public constant MAX_PAYLOAD_BYTES = 8192;
+    /// The header carries only `alg`, `kid` and `typ`. 1 KB is already generous.
+    uint256 public constant MAX_HEADER_BYTES = 1024;
+
     event KeyAdded(bytes32 indexed kidHash, bytes kid);
     event KeyRemoved(bytes32 indexed kidHash, bytes kid);
     event SubPrefixChanged(string prefix);
@@ -84,6 +104,8 @@ contract ConfidentialSpaceVerifier is Ownable2Step, IVtpmAttestation {
     error SecureBootOff();
     error BadSubject(bytes got);
     error NotAnOidcToken();
+    /// A JWT part is longer than this contract will scan. See MAX_PAYLOAD_BYTES.
+    error PartTooLong(uint256 got, uint256 max);
 
     // --- JWKS administration ---------------------------------------------------------------------
 
@@ -140,6 +162,11 @@ contract ConfidentialSpaceVerifier is Ownable2Step, IVtpmAttestation {
         view
         returns (string memory imageDigest, bytes32 eatNonce)
     {
+        // BEFORE the signature check, which is the expensive half: rejecting an oversized part
+        // after paying for an RSA verification and a Base64 re-encode would defeat the point.
+        if (payload.length > MAX_PAYLOAD_BYTES) revert PartTooLong(payload.length, MAX_PAYLOAD_BYTES);
+        if (header.length > MAX_HEADER_BYTES) revert PartTooLong(header.length, MAX_HEADER_BYTES);
+
         _verifySignature(header, payload, signature);
         _validateClaims(payload);
 

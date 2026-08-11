@@ -100,12 +100,31 @@ contract SealedCompetition is Ownable2Step {
     uint256 public constant MAX_WINNER_SLOTS = 16;
     uint256 public constant MAX_ENTRIES = 512;
 
+    /// Cap on the number of (feedId, value, proof) triples one settlement may carry.
+    ///
+    /// Same reasoning as MAX_ENTRIES: each proof costs a Merkle verification against the FTSO
+    /// verifier, so an unbounded array is a settlement that runs out of gas — and because
+    /// settlement is the only way funds leave, an un-settleable competition locks the prize and
+    /// every stake until the cancel window opens.
+    ///
+    /// 10 is well past a sane portfolio. The engine caps the asset union to match and covers the
+    /// first MAX_PROOFS assets in sorted order, so exceeding it degrades the ATTESTATION of the
+    /// tail rather than blocking settlement — a hostile entrant naming a hundred assets must not
+    /// be able to stop everyone else being paid.
+    uint256 public constant MAX_PROOFS = 10;
+
     /// QUADRA. Stakes and prizes are denominated in it; gas is still native C2FLR.
     IERC20 public immutable token;
     ITeeRegistry public immutable teeRegistry;
     IPassport public immutable passport;
     /// The FTSO anchor-feed verifier used to cross-check the signed ground truth. Zero = dev/skip.
     IFtsoFeedVerifier public immutable ftsoVerifier;
+
+    /// FTSO epoch geometry, so the contract can derive WHICH voting round covers `resolveAt` and
+    /// refuse a proof from a different time. Resolved from `FlareSystemsManager` at deploy and
+    /// injected — never hardcoded, for the reason `FtsoLib.GroundTruthWindow` states.
+    uint64 public immutable firstVotingRoundStartTs;
+    uint64 public immutable votingEpochDurationSeconds;
 
     /// Who may open a competition. Quadra gated `create_competition` on a `CompetitionCap` object;
     /// Flare has no object capabilities, so the same authority is an address allow-list. The
@@ -138,9 +157,15 @@ contract SealedCompetition is Ownable2Step {
     //
     // `score` is uint64, not the uint8 a scoring-only market would use, because a PERFORMANCE
     // competition ranks on `PERF_BASE + roi_bps` (around 1e6).
+    //
+    // `Settlement` carries feedIds and groundTruthValues as PARALLEL ARRAYS rather than one value.
+    // A portfolio competition is scored against several assets, and a settlement that named only
+    // one left the rest attested by the TEE signature alone. Binding the feed ids INTO the
+    // signature is what lets `FtsoLib.checkGroundTruths` refuse a proof for an asset the TEE never
+    // named — see that function's header for why that is the load-bearing half.
     bytes32 private constant ENTRY_TYPEHASH = keccak256("Entry(address agent,uint64 score)");
     bytes32 private constant SETTLEMENT_TYPEHASH = keccak256(
-        "Settlement(bytes32 competitionId,bytes32 receiptHash,uint256 groundTruthValue,Entry[] entries)Entry(address agent,uint64 score)"
+        "Settlement(bytes32 competitionId,bytes32 receiptHash,bytes21[] feedIds,uint256[] groundTruthValues,Entry[] entries)Entry(address agent,uint64 score)"
     );
     bytes32 private immutable DOMAIN_SEPARATOR;
 
@@ -187,6 +212,9 @@ contract SealedCompetition is Ownable2Step {
     error NotSettled();
     error NotCreator();
     error BadTeeSignature();
+    /// The registry has no TEE bound — deliberately revoked, or never wired. Distinct from
+    /// `BadTeeSignature` so a paused system is legible and a relayer can stop retrying.
+    error TeeRevoked();
     error BadReceipt();
     error EntryNotJoined();
     error DuplicateEntry();
@@ -194,6 +222,7 @@ contract SealedCompetition is Ownable2Step {
     error ActionIdConsumed();
     error TooManySlots();
     error TooManyEntries();
+    error TooManyProofs();
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrant();
@@ -202,13 +231,26 @@ contract SealedCompetition is Ownable2Step {
         _lock = 1;
     }
 
-    constructor(address token_, address teeRegistry_, address passport_, address ftsoVerifier_) {
+    constructor(
+        address token_,
+        address teeRegistry_,
+        address passport_,
+        address ftsoVerifier_,
+        uint64 firstVotingRoundStartTs_,
+        uint64 votingEpochDurationSeconds_
+    ) {
         if (token_ == address(0)) revert ZeroAddress();
+        // A zero duration divides by zero in every round calculation, and it is only reachable by
+        // deploying without resolving the geometry — which is exactly the mistake worth catching
+        // at construction rather than at the first settlement.
+        if (votingEpochDurationSeconds_ == 0) revert FtsoLib.BadVotingEpoch();
         token = IERC20(token_);
         operators[msg.sender] = true;
         teeRegistry = ITeeRegistry(teeRegistry_);
         passport = IPassport(passport_);
         ftsoVerifier = IFtsoFeedVerifier(ftsoVerifier_);
+        firstVotingRoundStartTs = firstVotingRoundStartTs_;
+        votingEpochDurationSeconds = votingEpochDurationSeconds_;
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
@@ -341,9 +383,16 @@ contract SealedCompetition is Ownable2Step {
     }
 
     /// Settlement: only the registered TEE can post it. Double verification: (1) recover the EIP-712
-    /// signer and require it is the registered TEE, (2) cross-check `groundTruthValue` against the
-    /// FTSO anchor-feed Merkle proof, so even the TEE cannot fabricate the resolution value.
-    /// `proof` is public oracle data and is NOT part of the signed struct.
+    /// signer and require it is the registered TEE, (2) cross-check EVERY signed `groundTruthValue`
+    /// against an FTSO anchor-feed Merkle proof FOR THE FEED IT NAMES, so even the TEE cannot
+    /// fabricate a resolution value and no relayer can swap in a different asset's proof.
+    ///
+    /// `proofs` is public oracle data and is NOT part of the signed struct — but `feedIds` IS, which
+    /// is what binds each proof to the asset the TEE meant. See `FtsoLib.checkGroundTruths`.
+    ///
+    /// A single-asset competition passes length-1 arrays. There is deliberately no scalar overload:
+    /// two entry points into the payout rules is two things to keep in agreement, and this is
+    /// exactly where a silent divergence would be most expensive.
     ///
     /// Every entry must have actually joined. The reference wrote `joined` and `submissions` and then
     /// never read either, so the TEE's entry list was trusted wholesale: it could name addresses that
@@ -353,10 +402,11 @@ contract SealedCompetition is Ownable2Step {
     function settle(
         bytes32 competitionId,
         bytes32 receiptHash,
-        uint256 groundTruthValue,
+        bytes21[] calldata feedIds,
+        uint256[] calldata groundTruthValues,
         EntryInput[] calldata entries,
         bytes calldata signature,
-        IFtsoFeedVerifier.FeedDataWithProof calldata proof,
+        IFtsoFeedVerifier.FeedDataWithProof[] calldata proofs,
         bytes calldata receipt
     ) external nonReentrant {
         Competition storage c = competitions[competitionId];
@@ -367,12 +417,42 @@ contract SealedCompetition is Ownable2Step {
         if (keccak256(receipt) != receiptHash) revert BadReceipt();
 
         {
-            address signer = _recoverSettlement(competitionId, receiptHash, groundTruthValue, entries, signature);
-            if (signer == address(0) || signer != teeRegistry.activeTeeWallet()) revert BadTeeSignature();
+            // Registry state BEFORE signature state, matching the guard order used everywhere else
+            // here: the terminal condition is asserted first, so a revoked registry says so instead
+            // of being reported as a bad signature.
+            address tee = _activeTee();
+            address signer =
+                _recoverSettlement(competitionId, receiptHash, feedIds, groundTruthValues, entries, signature);
+            if (signer == address(0) || signer != tee) revert BadTeeSignature();
         }
-        FtsoLib.checkGroundTruth(ftsoVerifier, groundTruthValue, proof);
+        _checkGroundTruths(competitionId, feedIds, groundTruthValues, proofs);
 
         _finishSettle(competitionId, receiptHash, entries, receipt);
+    }
+
+    /// The market's own cap on top of the library's shape checks, so both settlement paths get it.
+    ///
+    /// `resolveAt` is read from STORAGE, never from the settlement payload — it is what the
+    /// creator committed to when the competition opened, so neither the enclave nor the relayer
+    /// can choose which instant their proofs are judged against.
+    function _checkGroundTruths(
+        bytes32 competitionId,
+        bytes21[] memory feedIds,
+        uint256[] memory groundTruthValues,
+        IFtsoFeedVerifier.FeedDataWithProof[] memory proofs
+    ) private view {
+        if (feedIds.length > MAX_PROOFS) revert TooManyProofs();
+        FtsoLib.checkGroundTruths(
+            FtsoLib.GroundTruthWindow({
+                verifier: ftsoVerifier,
+                firstVotingRoundStartTs: firstVotingRoundStartTs,
+                votingEpochDurationSeconds: votingEpochDurationSeconds,
+                settlementTimeSecs: competitions[competitionId].resolveAt
+            }),
+            feedIds,
+            groundTruthValues,
+            proofs
+        );
     }
 
     // --- Flare Confidential Compute settlement ---------------------------------------------------
@@ -381,13 +461,19 @@ contract SealedCompetition is Ownable2Step {
     // so the stack keeps settling through the proven path while the extension is stood up.
 
     /// What the enclave returns for EVALUATION/SETTLE_COMP.
+    ///
+    /// Field ORDER mirrors the EIP-712 `Settlement` struct through `entries`, so the two layouts
+    /// can be read against each other. `quadra-core/fcc` carries the TypeScript twin of this and
+    /// `abi.decode` on a mismatched layout does not fail politely — it reverts with no reason, or
+    /// yields plausible garbage.
     struct TeeCompetitionSettlement {
         bytes32 competitionId;
         bytes32 receiptHash;
-        uint256 groundTruthValue;
+        bytes21[] feedIds;
+        uint256[] groundTruthValues;
         EntryInput[] entries;
         bytes receipt;
-        IFtsoFeedVerifier.FeedDataWithProof proof;
+        IFtsoFeedVerifier.FeedDataWithProof[] proofs;
     }
 
     /// Settle on an enclave-attested result. Permissionless: the signature is the authority, so
@@ -399,8 +485,9 @@ contract SealedCompetition is Ownable2Step {
         uint8 status,
         bytes calldata signature
     ) external nonReentrant {
+        address tee = _activeTee();
         address signer = TeeActionResult.recoverSigner(resultData, actionId, submissionTag, status, signature);
-        if (signer == address(0) || signer != teeRegistry.activeTeeWallet()) revert BadTeeSignature();
+        if (signer == address(0) || signer != tee) revert BadTeeSignature();
         // Ours, not FCC's: the signed digest covers the chain id but not a verifying contract, so a
         // result stays valid against any deployment on this chain trusting the same machine.
         if (consumedActionId[actionId]) revert ActionIdConsumed();
@@ -414,7 +501,7 @@ contract SealedCompetition is Ownable2Step {
         if (c.cancelled) revert AlreadyCancelled();
         if (block.timestamp < c.resolveAt) revert TooEarly();
         if (keccak256(s.receipt) != s.receiptHash) revert BadReceipt();
-        FtsoLib.checkGroundTruth(ftsoVerifier, s.groundTruthValue, s.proof);
+        _checkGroundTruths(s.competitionId, s.feedIds, s.groundTruthValues, s.proofs);
 
         _finishSettle(s.competitionId, s.receiptHash, s.entries, s.receipt);
     }
@@ -537,10 +624,19 @@ contract SealedCompetition is Ownable2Step {
         emit RemainingWithdrawn(competitionId, c.creator, amount);
     }
 
+    /// Rebuild the EIP-712 digest.
+    ///
+    /// EIP-712 hashes a dynamic array as `keccak256` of the concatenated `encodeData` of its
+    /// elements — 32 bytes each, right-padded for `bytesN`. `abi.encodePacked` over a memory array
+    /// pads its elements to 32 bytes (unlike `abi.encodePacked` over loose arguments, which does
+    /// not), so it produces exactly that concatenation for `bytes21[]`, `uint256[]` and the
+    /// `bytes32[]` of entry hashes alike. This is the same construction the entry list already
+    /// used; the two new lines are not a different technique.
     function _recoverSettlement(
         bytes32 competitionId,
         bytes32 receiptHash,
-        uint256 groundTruthValue,
+        bytes21[] calldata feedIds,
+        uint256[] calldata groundTruthValues,
         EntryInput[] calldata entries,
         bytes calldata signature
     ) private view returns (address) {
@@ -553,7 +649,8 @@ contract SealedCompetition is Ownable2Step {
                 SETTLEMENT_TYPEHASH,
                 competitionId,
                 receiptHash,
-                groundTruthValue,
+                keccak256(abi.encodePacked(feedIds)),
+                keccak256(abi.encodePacked(groundTruthValues)),
                 keccak256(abi.encodePacked(entryHashes))
             )
         );
@@ -561,6 +658,18 @@ contract SealedCompetition is Ownable2Step {
         return SignatureLib.recover(digest, signature);
     }
 
+
+    /// The registered TEE wallet, refusing a revoked (or never-wired) registry by name.
+    ///
+    /// Without this a zero `activeTeeWallet` reached the `signer != tee` comparison and produced
+    /// `BadTeeSignature` — the same error a genuinely bad signature gives — so "the operator
+    /// paused settlement" and "this relayer built a bad payload" were indistinguishable from
+    /// outside. One is terminal and one is worth retrying, which is precisely the distinction a
+    /// keeper needs to make.
+    function _activeTee() private view returns (address tee) {
+        tee = teeRegistry.activeTeeWallet();
+        if (tee == address(0)) revert TeeRevoked();
+    }
 
     /// Non-empty and summing to exactly 100 (Quadra `valid_split`, PCT_DENOM = 100).
     function _validSplit(uint16[] calldata splitPct) internal pure returns (bool) {

@@ -21,6 +21,16 @@
         "name": "ftsoVerifier_",
         "type": "address",
         "internalType": "address"
+      },
+      {
+        "name": "firstVotingRoundStartTs_",
+        "type": "uint64",
+        "internalType": "uint64"
+      },
+      {
+        "name": "votingEpochDurationSeconds_",
+        "type": "uint64",
+        "internalType": "uint64"
       }
     ],
     "stateMutability": "nonpayable"
@@ -67,6 +77,19 @@
   {
     "type": "function",
     "name": "MAX_ENTRIES",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "MAX_PROOFS",
     "inputs": [],
     "outputs": [
       {
@@ -291,6 +314,19 @@
   },
   {
     "type": "function",
+    "name": "firstVotingRoundStartTs",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "ftsoVerifier",
     "inputs": [],
     "outputs": [
@@ -492,9 +528,14 @@
         "internalType": "bytes32"
       },
       {
-        "name": "groundTruthValue",
-        "type": "uint256",
-        "internalType": "uint256"
+        "name": "feedIds",
+        "type": "bytes21[]",
+        "internalType": "bytes21[]"
+      },
+      {
+        "name": "groundTruthValues",
+        "type": "uint256[]",
+        "internalType": "uint256[]"
       },
       {
         "name": "entries",
@@ -519,9 +560,9 @@
         "internalType": "bytes"
       },
       {
-        "name": "proof",
-        "type": "tuple",
-        "internalType": "struct IFtsoFeedVerifier.FeedDataWithProof",
+        "name": "proofs",
+        "type": "tuple[]",
+        "internalType": "struct IFtsoFeedVerifier.FeedDataWithProof[]",
         "components": [
           {
             "name": "proof",
@@ -727,6 +768,19 @@
     ],
     "outputs": [],
     "stateMutability": "nonpayable"
+  },
+  {
+    "type": "function",
+    "name": "votingEpochDurationSeconds",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint64",
+        "internalType": "uint64"
+      }
+    ],
+    "stateMutability": "view"
   },
   {
     "type": "function",
@@ -1147,6 +1201,11 @@
   },
   {
     "type": "error",
+    "name": "BadVotingEpoch",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "DuplicateEntry",
     "inputs": []
   },
@@ -1157,12 +1216,54 @@
   },
   {
     "type": "error",
+    "name": "FeedIdMismatch",
+    "inputs": [
+      {
+        "name": "signed",
+        "type": "bytes21",
+        "internalType": "bytes21"
+      },
+      {
+        "name": "proven",
+        "type": "bytes21",
+        "internalType": "bytes21"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "FeedIdsNotSorted",
+    "inputs": [
+      {
+        "name": "previous",
+        "type": "bytes21",
+        "internalType": "bytes21"
+      },
+      {
+        "name": "next",
+        "type": "bytes21",
+        "internalType": "bytes21"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "GroundTruthLengthMismatch",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "GroundTruthMismatch",
     "inputs": []
   },
   {
     "type": "error",
     "name": "NoCompetition",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "NoGroundTruth",
     "inputs": []
   },
   {
@@ -1233,12 +1334,38 @@
   },
   {
     "type": "error",
+    "name": "StaleVotingRound",
+    "inputs": [
+      {
+        "name": "expected",
+        "type": "uint256",
+        "internalType": "uint256"
+      },
+      {
+        "name": "proven",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ]
+  },
+  {
+    "type": "error",
+    "name": "TeeRevoked",
+    "inputs": []
+  },
+  {
+    "type": "error",
     "name": "TooEarly",
     "inputs": []
   },
   {
     "type": "error",
     "name": "TooManyEntries",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "TooManyProofs",
     "inputs": []
   },
   {
