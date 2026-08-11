@@ -48,12 +48,14 @@ contract TeeRegistry is Ownable2Step {
     event TeeRegistered(address indexed teeWallet, string imageDigest);
     event FccTeeRegistered(address indexed teeMachine, uint256 extensionId);
     event FccConfigured(address indexed teeMachineRegistry, uint256 extensionId);
+    event ExpectedImageDigestChanged(string imageDigest);
 
     error VtpmUnset();
     error BadImageDigest();
     error BadNonce();
     error FccUnset();
     error NoTeeAvailable();
+    error EmptyImageDigest();
 
     constructor(string memory expectedImageDigest_, address vtpm_) {
         expectedImageDigest = expectedImageDigest_;
@@ -103,6 +105,28 @@ contract TeeRegistry is Ownable2Step {
         activeTeeWallet = teeWallet;
         activeTeePublicKey = teePublicKey;
         emit TeeRegistered(teeWallet, imageDigest);
+    }
+
+    /// Move the pinned code identity to a new image digest.
+    ///
+    /// Without this, the digest is fixed at construction and can only be moved as a side effect of
+    /// the DEV `setActiveTee` — so shipping a new build of the enclave would mean redeploying this
+    /// registry, and with it both markets, which hold it `immutable`. That is a redeploy per
+    /// enclave release, which is not a workable release cadence.
+    ///
+    /// It is genuinely privileged: whoever holds the owner key decides which code the chain will
+    /// accept attestations from. That is the same authority `setActiveTee` already carries, and it
+    /// is bounded the same way — the owner can name a digest, but only a real Confidential Space
+    /// VM running THAT image can then bind a key through `register`. What the owner cannot do is
+    /// bind a key without an attestation.
+    ///
+    /// Deliberately does NOT clear `activeTeeWallet`. The running enclave keeps settling while the
+    /// new image is rolled out, and the moment its instance re-registers, the new one takes over.
+    /// Clearing it here would strand every in-flight settlement on a registry with no signer.
+    function setExpectedImageDigest(string calldata imageDigest) external onlyOwner {
+        if (bytes(imageDigest).length == 0) revert EmptyImageDigest();
+        expectedImageDigest = imageDigest;
+        emit ExpectedImageDigestChanged(imageDigest);
     }
 
     /// Point the registry at Flare's TEE machine registry and our allocated extension id. Owner-only,
