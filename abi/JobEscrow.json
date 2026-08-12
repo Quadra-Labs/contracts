@@ -52,7 +52,33 @@
   },
   {
     "type": "function",
+    "name": "MIN_DELIVERY_WINDOW_SECS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
     "name": "PRICE_DECIMALS",
+    "inputs": [],
+    "outputs": [
+      {
+        "name": "",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
+    "stateMutability": "view"
+  },
+  {
+    "type": "function",
+    "name": "REFUND_GRACE_SECS",
     "inputs": [],
     "outputs": [
       {
@@ -1038,6 +1064,11 @@
   {
     "type": "error",
     "name": "Reentrant",
+    "inputs": []
+  },
+  {
+    "type": "error",
+    "name": "RefundLocked",
     "inputs": []
   },
   {

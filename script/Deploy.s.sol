@@ -2,6 +2,7 @@
 pragma solidity 0.8.25;
 
 import {Script} from "forge-std/Script.sol";
+import {VmSafe} from "forge-std/Vm.sol";
 import {console2} from "forge-std/console2.sol";
 
 import {TeeRegistry} from "../src/TeeRegistry.sol";
@@ -43,6 +44,9 @@ contract Deploy is Script {
     /// The FTSO voting-round geometry could not be resolved and DEV is not set.
     error MissingVotingEpoch();
     error RecordersNotWired();
+    /// No `QUADRA_TOKEN`, and `MINT_NEW_TOKEN` was not set to say a fresh supply is intended.
+    /// Reuse the live token, or opt in explicitly — do not arrive at a new one by omission.
+    error MissingQuadraToken();
 
     function run() external {
         bool dev = vm.envOr("DEV", false);
@@ -94,9 +98,17 @@ contract Deploy is Script {
         else vm.startBroadcast();
 
         // QUADRA_TOKEN lets a redeploy of the markets reuse the existing token, so agent balances
-        // and the fee history survive. Unset mints a fresh supply to the treasury.
+        // and the fee history survive.
+        //
+        // MINTING A FRESH SUPPLY IS NOW OPT-IN. It used to be what happened when this variable was
+        // simply forgotten — and it is not in `contracts/.env`, so forgetting it meant typing one
+        // fewer thing on a long command line. The result was silent and expensive: markets
+        // denominated in a brand-new token, every existing balance stranded on the old one, and
+        // nothing anywhere reporting a problem. A fresh token is a legitimate thing to want on a
+        // first deployment; it is never something to arrive at by omission.
         address tokenAddr = vm.envOr("QUADRA_TOKEN", address(0));
         if (tokenAddr == address(0)) {
+            if (!vm.envOr("MINT_NEW_TOKEN", false)) revert MissingQuadraToken();
             tokenAddr = address(new QuadraToken(treasury));
         }
 
@@ -258,6 +270,17 @@ contract Deploy is Script {
             vm.toString(w.vtpmVerifier),
             '"\n}\n'
         );
+        // A DRY RUN MUST NOT TOUCH THIS FILE.
+        //
+        // `forge script` without `--broadcast` withholds the TRANSACTIONS, not the script body — so
+        // this function still runs and used to overwrite the canonical address file with addresses
+        // that were computed but never deployed. Every repo reads this file to find the contracts,
+        // so the result was a whole workspace pointed at empty addresses, from a command whose
+        // entire purpose is to change nothing. Hit for real on 2026-08-12; see DEPLOYMENT-STATE.
+        if (vm.isContext(VmSafe.ForgeContext.ScriptDryRun)) {
+            console2.log("DRY RUN            ", path, "NOT written (simulated addresses above)");
+            return;
+        }
         vm.writeFile(path, json);
         console2.log("wrote             ", path);
     }

@@ -31,7 +31,9 @@ interface IPassport {
 ///                       and no oracle data: an agent is paid for delivering valid work on time, NOT
 ///                       for being right. Anything else and no agent could price a job.
 ///   4. `refundNotDelivered` if nothing valid arrived by `deliveryDeadline`, the escrow goes back to
-///                       the user and the agent is scored 0.
+///                       the user, and the agent is scored 0 IF nothing was delivered. A delivered
+///                       job that is refunded anyway stays scorable, so step 5 can still record what
+///                       the work was actually worth.
 ///   5. `scoreJob`       LATER, at `lifetimeEnd`, the evaluation engine posts an EIP-712-signed score
 ///                       cross-checked against an FTSO anchor proof. Reputation only, no funds move.
 ///                       (Not in this contract yet — it arrives with the settlement layer.)
@@ -85,6 +87,26 @@ contract JobEscrow is Ownable2Step {
     /// already promised this getter existed on both markets; it did not, and a silent disagreement
     /// mis-scales every price by a power of ten with no compile signal on either side.
     uint256 public constant PRICE_DECIMALS = FtsoLib.PRICE_DECIMALS;
+
+    /// How long after `deliveryDeadline` the BUYER must wait to refund a job that WAS delivered.
+    ///
+    /// Zero for an undelivered job, and zero for the intake engine either way — this window exists
+    /// only for the case where work demonstrably arrived. Without it, `refundNotDelivered` and
+    /// `releasePayment` become a plain race from the deadline onward, and the buyer wins it by
+    /// simply sending first: the delivery is already readable (the envelope wraps the AES key to
+    /// their own `userPubKey`), so they keep the work and take the escrow back.
+    ///
+    /// 1800 is Quadra's own `REFUND_WAIT_MS` (30 minutes) in seconds. The port deleted that
+    /// constant when it replaced the fixed window with a per-job deadline, which was right for
+    /// WHEN the window opens and wrong for how quickly the buyer's escape hatch does.
+    uint256 public constant REFUND_GRACE_SECS = 1800;
+
+    /// The shortest `deliveryDeadline` `payForJob` accepts, measured from now.
+    ///
+    /// A deadline of `now + 1` is a job nobody can service: the agent must produce, seal and land a
+    /// transaction, and the intake engine must then validate the delivery and release before the
+    /// refund window opens. Sized to that round trip rather than to the agent's work alone.
+    uint256 public constant MIN_DELIVERY_WINDOW_SECS = 600;
 
     mapping(bytes32 => Job) public jobs;
     mapping(bytes32 => bytes32) public deliveredHash; // jobId => keccak(ciphertext)
@@ -160,6 +182,10 @@ contract JobEscrow is Ownable2Step {
     error BadUserKey();
     /// `evaluatorId` is empty, which would open a Passport track under `keccak256("")`.
     error BadEvaluator();
+    /// The BUYER tried to refund a job that WAS delivered, inside `REFUND_GRACE_SECS`. Distinct
+    /// from `TooEarly` on purpose: the deadline has passed, and the caller is being told that this
+    /// particular caller must wait longer for this particular job, not that the clock has not run.
+    error RefundLocked();
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrant();
@@ -233,7 +259,12 @@ contract JobEscrow is Ownable2Step {
         if (jobs[jobId].user != address(0)) revert JobExists();
         if (agent == address(0)) revert BadAgent();
         if (cost == 0) revert NoEscrow();
-        if (deliveryDeadline <= block.timestamp) revert BadDeadline();
+        // A FLOOR, not merely a future instant. `now + 1` is a well-formed job that no agent can
+        // service and no intake engine can validate in time, so the escrow's only reachable exit is
+        // the refund — which makes it a way to write zeroes into a stranger's Passport track for the
+        // price of gas. `MIN_DELIVERY_WINDOW_SECS` is sized to the produce-deliver-validate-release
+        // round trip, so a deadline this contract accepts is one the system can actually meet.
+        if (deliveryDeadline < block.timestamp + MIN_DELIVERY_WINDOW_SECS) revert BadDeadline();
         if (lifetimeEnd < deliveryDeadline) revert BadDeadline();
         if (userPubKey.length != 65 || userPubKey[0] != 0x04) revert BadUserKey();
         if (bytes(evaluatorId).length == 0) revert BadEvaluator();
@@ -333,12 +364,39 @@ contract JobEscrow is Ownable2Step {
         emit PaymentReleased(jobId, agent, agentAmount, fee);
     }
 
-    /// Nothing valid arrived in time: return the escrow to the user and score the agent 0.
+    /// Nothing valid arrived in time: return the escrow to the user.
     ///
     /// Note this does NOT require `!delivered`. A delivery that failed the template check is worth
     /// no more than no delivery at all, and the alternative — locking the escrow forever whenever a
     /// malformed result was posted — would strand the user's funds. Callable by the intake engine or
     /// by the user themselves, so a stalled intake can never trap a refund.
+    ///
+    /// THREE CLOCKS, because "delivered" changes who is owed what:
+    ///
+    /// | job state                  | who        | may refund from                        |
+    /// | -------------------------- | ---------- | -------------------------------------- |
+    /// | nothing delivered          | either     | `deliveryDeadline` (exclusive)         |
+    /// | delivered, intake calling  | intake     | `deliveryDeadline` (exclusive)         |
+    /// | delivered, buyer calling   | the buyer  | `deliveryDeadline + REFUND_GRACE_SECS` |
+    ///
+    /// The grace exists because from the deadline onward this function and `releasePayment` are
+    /// otherwise a plain race decided by whoever is mined first — and the buyer can win it while
+    /// KEEPING THE WORK, since `deliver` puts the ciphertext in calldata and the envelope wraps the
+    /// AES key to their own `userPubKey`. It is bounded rather than open-ended precisely so the
+    /// escrow is never stranded, which is what the paragraph above is protecting. Intake is exempt:
+    /// it refunds holding a verdict, and delaying it would only delay a refund the buyer is owed.
+    ///
+    /// The clock is EXCLUSIVE (`<=` reverts) while `deliver` accepts `block.timestamp ==
+    /// deliveryDeadline`, so a delivery landing on the deadline cannot be refunded out from under
+    /// itself in the same block. One instant either way is worth nothing; the ambiguity is not.
+    ///
+    /// A DELIVERED JOB IS NOT SCORED HERE. The mandatory zero and `scored = true` apply only when
+    /// nothing was delivered, where they are the job's honest final word. Writing them for a
+    /// delivered job forecloses the REAL score permanently — `scoreJob` and `scoreJobFromTee` then
+    /// revert `AlreadyScored`, so the job can never emit `JobScored` or `ReceiptPublished` and the
+    /// agent carries a zero for work it may have done correctly. A refunded-but-delivered job
+    /// therefore ends `released == true, scored == false`, which is exactly the state the scoring
+    /// paths require, and the evaluation engine still settles it at `lifetimeEnd`.
     ///
     /// The Passport write is deliberately non-fatal. Quadra's `refund_not_delivered` had no
     /// cross-module dependency at all — it simply emitted `agent_score: 0` — whereas here a Passport
@@ -350,21 +408,31 @@ contract JobEscrow is Ownable2Step {
         if (j.user == address(0)) revert NoJob();
         if (msg.sender != intake && msg.sender != j.user) revert NotRefunder();
         if (j.released) revert AlreadyReleased();
-        if (block.timestamp < j.deliveryDeadline) revert TooEarly();
+        if (block.timestamp <= j.deliveryDeadline) revert TooEarly();
+
+        bool wasDelivered = j.delivered;
+        if (
+            wasDelivered &&
+            msg.sender != intake &&
+            block.timestamp < uint256(j.deliveryDeadline) + REFUND_GRACE_SECS
+        ) revert RefundLocked();
 
         // Effects.
         uint256 amount = j.escrow;
         j.escrow = 0;
         j.released = true;
-        j.scored = true; // the 0 below is this job's final word on reputation
         address user = j.user;
         address agent = j.agent;
         bytes32 category = j.category;
+        // Only when nothing arrived is the 0 this job's final word on reputation.
+        if (!wasDelivered) j.scored = true;
 
         // Interactions.
-        try passport.record(agent, category, 0, jobId) {}
-        catch {
-            emit PassportRecordFailed(jobId, agent);
+        if (!wasDelivered) {
+            try passport.record(agent, category, 0, jobId) {}
+            catch {
+                emit PassportRecordFailed(jobId, agent);
+            }
         }
         token.safeTransfer(user, amount);
 
